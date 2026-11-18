@@ -161,7 +161,7 @@ main { max-width: 960px; margin: 0 auto; padding: 16px; }
 .rate-card.compare .rate-head b { color: var(--agile); }
 .compare-box { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
 .compare-box .cheaper { color: var(--teal); font-weight: 600; }
-.compare-box .dearer { color: #d33; font-weight: 600; }
+.compare-box .pricier { color: #d33; font-weight: 600; }
 .compare-box a { color: var(--primary); }
 .now-tag { font-size: 11px; background: var(--teal-bright); color: #000; border-radius: 4px; padding: 0 5px; margin-left: 4px; }
 details.group { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 10px; }
@@ -209,6 +209,6 @@ details.group[open] > summary::after { transform: rotate(90deg); }
 .yours { font-size: 11px; background: var(--teal-bright); color: #000; border-radius: 4px; padding: 0 5px; margin-left: 3px; vertical-align: 1px; }
 .switch-tag { display: inline-block; font-size: 12px; font-weight: 600; color: var(--primary); border: 1px solid var(--primary); border-radius: 999px; padding: 1px 10px; margin-bottom: 6px; }
 .cheaper { color: var(--teal); font-weight: 600; }
-.dearer { color: #d33; font-weight: 600; }
+.pricier { color: #d33; font-weight: 600; }
 .tariff-note { margin: -2px 0 6px; }
 .tariff-note b { color: var(--text); font-weight: 600; }

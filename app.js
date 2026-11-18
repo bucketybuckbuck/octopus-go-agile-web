@@ -673,7 +673,7 @@ function priceShade(p) {
 
 /**
  * Automatic price-list thresholds: over the last week of Agile prices (plus today/tomorrow),
- * the cheapest quarter of half-hours counts as "low" and the dearest quarter as "high".
+ * the cheapest quarter of half-hours counts as "low" and the most expensive quarter as "high".
  */
 async function updateAutoThresholds(upcoming) {
   const today = midnight(new Date()).getTime();
@@ -822,7 +822,7 @@ function signedDiff(alt, paid, isExport) {
   // Positive = the alternative would have been better for you.
   const better = isExport ? alt - paid : paid - alt;
   if (Math.abs(better) < 0.5) return '<span class="muted">about the same</span>';
-  return `<span class="${better > 0 ? 'cheaper' : 'dearer'}">${pounds(Math.abs(better))} ${isExport ? (better > 0 ? 'more' : 'less') : (better > 0 ? 'cheaper' : 'dearer')}</span>`;
+  return `<span class="${better > 0 ? 'cheaper' : 'pricier'}">${pounds(Math.abs(better))} ${isExport ? (better > 0 ? 'more' : 'less') : (better > 0 ? 'cheaper' : 'more expensive')}</span>`;
 }
 
 function dayCardInner(day, date, isExport, switched, current) {
@@ -1282,7 +1282,7 @@ function addAgileComparison(rows, loaded) {
     if (a == null || b == null) return '';
     const d = a - b;
     if (Math.abs(d) < 0.005) return `<span class="muted">same as yours</span>`;
-    return `<span class="${d < 0 ? 'cheaper' : 'dearer'}">${pence(Math.abs(d))}${unit} ${d < 0 ? 'cheaper' : 'dearer'}</span>`;
+    return `<span class="${d < 0 ? 'cheaper' : 'pricier'}">${pence(Math.abs(d))}${unit} ${d < 0 ? 'cheaper' : 'more expensive'}</span>`;
   };
   const lines = [];
   if (!mine.twoRate) {
@@ -1419,7 +1419,7 @@ function renderSettings() {
 
     ${section('compare', 'Comparison', `Billing starts day ${esc(settings.startDay)}${settings.smartTariff ? ' · warnings on' : ''}`, `
       ${field('startDay', 'Billing start day', 'number', { hint: 'Day of the month your bill starts (1–28)' })}
-      ${field('smartTariff', 'Warn on dearer days', 'checkbox', { hint: 'Highlight days where Agile or Go would have been cheaper than the tariff you were on' })}
+      ${field('smartTariff', 'Highlight days another tariff was cheaper', 'checkbox', { hint: 'Marks days where Agile or Go would have cost less than the tariff you were on' })}
       ${(settings.elecAgreements || []).length ? '' : field('currentTariff', "Tariff you're on", 'select', { dep: 'smartTariff', hint: 'Connect your account and this is worked out day by day instead', options: [['go', 'Go'], ['agile', 'Agile']] })}
       ${field('highlightBorder', 'Highlight with border', 'checkbox', { dep: 'smartTariff', hint: 'Off = shaded background' })}
       ${field('showAverage', 'Show average unit rates', 'checkbox', { hint: "Agile's average price vs the average you actually paid" })}
@@ -1432,7 +1432,7 @@ function renderSettings() {
       ${field('avgDay', 'For', 'select', { dep: 'showDayAverage', options: [['today', 'Today'], ['tomorrow', 'Tomorrow']] })}
       ${field('highlightPrices', 'Colour prices', 'checkbox', { hint: 'Green below the low threshold, red above the high one' })}
       ${field('autoThresholds', 'Set thresholds automatically', 'checkbox', { dep: 'highlightPrices',
-        hint: `From the last week of Agile prices: cheapest quarter green, dearest quarter red. Currently below ${pence(num(settings.lowThreshold, 15))} / above ${pence(num(settings.highThreshold, 30))}.` })}
+        hint: `From the last week of Agile prices: cheapest quarter green, most expensive quarter red. Currently below ${pence(num(settings.lowThreshold, 15))} / above ${pence(num(settings.highThreshold, 30))}.` })}
       ${field('lowThreshold', 'Low threshold (p)', 'number', { dep: 'highlightPrices&!autoThresholds' })}
       ${field('highThreshold', 'High threshold (p)', 'number', { dep: 'highlightPrices&!autoThresholds' })}
     `, openGroups.has('home'))}
