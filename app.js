@@ -646,7 +646,8 @@ function needsSetup(what) {
   return `<div class="notice">
     <h2>Set up your account</h2>
     <p>${what} needs your Octopus API key and account number — the app looks up the rest.
-    Both are on your <a href="https://octopus.energy/dashboard/new/accounts/personal-details/api-access" target="_blank" rel="noopener">Octopus API access page</a>.</p>
+    Your account number is under your name on your <a href="https://octopus.energy/dashboard/new/accounts" target="_blank" rel="noopener">Octopus account home page</a>;
+    your API key is on the <a href="https://octopus.energy/dashboard/new/accounts/personal-details/api-access" target="_blank" rel="noopener">API access page</a>.</p>
     <p><a href="#settings" class="btn" style="text-decoration:none;display:inline-block">Open settings</a></p>
   </div>`;
 }
@@ -1366,10 +1367,11 @@ function renderSettings() {
   view().innerHTML = `<form class="settings" id="settings-form" autocomplete="off">
     <section class="card setup">
       <h2>Your Octopus account</h2>
-      <p class="small muted" style="margin:0 0 10px">Just two things — everything else (meters, region, tariffs, export and gas) is looked up for you.
-        Both are on your <a href="https://octopus.energy/dashboard/new/accounts/personal-details/api-access" target="_blank" rel="noopener">Octopus API access page</a>.</p>
-      ${field('apiKey', 'API key', 'password', { placeholder: 'sk_live_…' })}
-      ${field('accountNumber', 'Account number', 'text', { placeholder: 'A-1B2C3D4E' })}
+      <p class="small muted" style="margin:0 0 10px">Just two things — everything else (meters, region, tariffs, export and gas) is looked up for you.</p>
+      ${field('apiKey', 'API key', 'password', { placeholder: 'sk_live_…',
+        hint: 'On your Octopus <a href="https://octopus.energy/dashboard/new/accounts/personal-details/api-access" target="_blank" rel="noopener">API access page</a>. Press <i>Generate</i> if you don’t have one — it’s only shown once, so paste it straight in here.' })}
+      ${field('accountNumber', 'Account number', 'text', { placeholder: 'A-1B2C3D4E',
+        hint: 'Starts with A-. It’s under your name at the top of your <a href="https://octopus.energy/dashboard/new/accounts" target="_blank" rel="noopener">Octopus account home page</a>.' })}
       <div class="row" style="padding:6px 0 0">
         <button type="button" class="btn" id="connect">${settings.connected ? 'Refresh from account' : 'Connect'}</button>
         <span id="connect-status" class="small muted" role="status"></span>
