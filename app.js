@@ -762,7 +762,7 @@ async function renderHome(token) {
 function renderPriceList(prices) {
   const list = document.getElementById('price-list');
   const now = Date.now();
-  let shown = prices.slice().reverse(); // newest first, like the Android list
+  let shown = prices.slice(); // in time order, earliest first
   if (settings.showPriceNow) shown = shown.filter(x => x.t + HALF_HOUR > now);
   const rows = [];
   if (settings.showDayAverage) {
