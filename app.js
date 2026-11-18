@@ -981,6 +981,42 @@ function describeUnitRates(bands) {
   return { kind: 'time-of-use', html: lines.join('<br>') };
 }
 
+/** Plain average of a tariff's unit rate across today's half-hours. */
+function dayAverage(bands) {
+  const start = midnight(new Date()).getTime();
+  const end = addDays(new Date(start), 1).getTime();
+  const ps = [];
+  for (let t = start; t < end; t += HALF_HOUR) { const p = rateAt(bands, t); if (p != null) ps.push(p); }
+  return ps.length ? ps.reduce((a, b) => a + b, 0) / ps.length : null;
+}
+
+/** Under the Agile card, compare Agile with the tariff you're on: now, across today, and standing charge. */
+function addAgileComparison(rows, loaded) {
+  const ai = rows.findIndex(r => r.compare);
+  const mi = rows.findIndex(r => r.label === 'Electricity');
+  const agile = loaded[ai], mine = loaded[mi];
+  const el = document.querySelector(`#rate-${ai}`);
+  if (ai < 0 || !agile || !mine || !el) return;
+  const diff = (a, b, unit) => {
+    if (a == null || b == null) return '';
+    const d = a - b;
+    if (Math.abs(d) < 0.005) return `<span class="muted">same as yours</span>`;
+    return `<span class="${d < 0 ? 'cheaper' : 'dearer'}">${pence(Math.abs(d))}${unit} ${d < 0 ? 'cheaper' : 'dearer'}</span>`;
+  };
+  const lines = [];
+  if (!mine.twoRate) {
+    const now = Date.now();
+    lines.push(`<div class="kv"><span>Right now</span><div>${diff(rateAt(agile.unit, now), rateAt(mine.unit, now), '')}</div></div>`);
+    const aa = dayAverage(agile.unit), ma = dayAverage(mine.unit);
+    lines.push(`<div class="kv"><span>Today avg</span><div>${diff(aa, ma, '')}<div class="small muted">Agile ${pence(aa)} vs yours ${pence(ma)} — a plain average, not weighted by when you use power</div></div></div>`);
+  }
+  lines.push(`<div class="kv"><span>Standing</span><div>${diff(agile.standing, mine.standing, '/day')}</div></div>`);
+  const box = document.createElement('div');
+  box.className = 'compare-box';
+  box.innerHTML = `${lines.join('')}<p class="small" style="margin:6px 0 0"><a href="#history">See what you'd actually have paid on Agile →</a></p>`;
+  el.appendChild(box);
+}
+
 const KIND_NOTE = {
   'half-hourly': 'Changes every half hour',
   daily: 'Changes daily',
@@ -998,6 +1034,12 @@ async function renderCurrentRates() {
     settings.gasTariff && settings.gas && { label: 'Gas', name: c.gasTariff, code: settings.gasTariff },
     settings.exportTariff && settings.exportEnabled && { label: 'Export', name: c.exportTariff, code: settings.exportTariff, isExport: true },
   ].filter(Boolean);
+  // If you're not on Agile, show Agile in your region alongside for comparison.
+  const onAgile = tariffKind(productFromCode(settings.elecTariff)) === 'agile';
+  if (rows.length && settings.region && settings.agileProduct && !onAgile) {
+    rows.push({ label: 'Agile', name: 'Agile Octopus · for comparison', code: tariffCode(settings.agileProduct, settings.region), compare: true });
+  }
+  const loaded = [];
 
   if (!rows.length) {
     box.innerHTML = settings.connected
@@ -1006,7 +1048,7 @@ async function renderCurrentRates() {
     return;
   }
   box.innerHTML = `<h3>Your current rates</h3>${rows.map((r, i) => `
-    <div class="rate-card" id="rate-${i}">
+    <div class="rate-card${r.compare ? ' compare' : ''}" id="rate-${i}">
       <div class="rate-head"><b>${esc(r.label)}</b><span class="muted">${esc(r.name || productFromCode(r.code))}</span></div>
       <div class="rate-body muted small">Loading…</div>
     </div>`).join('')}
@@ -1016,6 +1058,7 @@ async function renderCurrentRates() {
     const el = document.querySelector(`#rate-${i} .rate-body`);
     try {
       const rates = await loadTariffRates(r.code);
+      loaded[i] = rates;
       if (!el.isConnected) return;
       let unitHtml, note = '';
       if (rates.twoRate) {
@@ -1036,6 +1079,7 @@ async function renderCurrentRates() {
       if (el.isConnected) el.textContent = `Couldn't load rates (${e.message})`;
     }
   }));
+  addAgileComparison(rows, loaded);
 }
 
 
