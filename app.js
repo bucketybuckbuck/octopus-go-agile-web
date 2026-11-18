@@ -1418,7 +1418,8 @@ function renderSettings() {
       ${field('timeshift', 'Enable load shift', 'checkbox')}
       ${field('loadThreshold', 'Shift half-hours above (kWh)', 'number', { dep: 'timeshift' })}
       ${field('baseload', 'Baseload left behind (kWh)', 'number', { dep: 'timeshift' })}
-      ${field('timeshiftAll', 'Show shifted on all days', 'checkbox', { dep: 'timeshift' })}
+      ${field('timeshiftAll', 'Open graphs in shifted view', 'checkbox', { dep: 'timeshift',
+        hint: 'Off: each day shows your real usage — tap a graph to see it shifted. On: every day starts shifted — tap to see real usage. Only the Go cost changes.' })}
       <div class="field" data-dep="timeshift"><span>Hours that can be shifted<small><a href="#" id="hours-all">All</a> · <a href="#" id="hours-none">None</a></small></span>
         <div class="hours-grid">${ALL_HOURS.map(h => `<label><input type="checkbox" name="hour" value="${h}" ${hours.has(h) ? 'checked' : ''}>${h}</label>`).join('')}</div></div>
     `, openGroups.has('shift'))}
