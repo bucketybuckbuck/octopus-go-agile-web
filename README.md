@@ -41,7 +41,6 @@ meter and gas tariff. You can still enter the details by hand under "Meter detai
 - **Gas readings in m³ or kWh are detected automatically** by comparing a year of readings with Octopus's annual
   estimate; the volume-correction and calorific-value settings are gone (standard values are used).
 - **Price list options are on by default**, with low/high thresholds worked out from the last week of Agile prices.
-
 - **Go rates come from the API.** The Android app hard-coded the Go and Go Faster windows and
   used old product codes (`AGILE-18-02-21`, `GO-18-06-12`, both retired). The web version reads Go's
   time-banded rates and real standing charges for both tariffs. Product codes can be set in Settings
