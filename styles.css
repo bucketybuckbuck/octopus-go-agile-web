@@ -18,6 +18,7 @@
   --bar: #03dac5;
   --bar-neg: #0383da;
   --bar-shift: #018786;
+  --mine: #546e7a;
   --grid: rgba(0, 0, 0, 0.08);
   color-scheme: light;
 }
@@ -35,6 +36,7 @@
     --now-text: #000000;
     --warn-bg: #400e0f;
     --agile: #bb86fc;
+    --mine: #b0bec5;
     --grid: rgba(255, 255, 255, 0.08);
     color-scheme: dark;
   }
@@ -42,7 +44,7 @@
 :root[data-theme="dark"] {
   --bg: #121212; --surface: #1e1e22; --text: #ece9f4; --muted: #a19db0; --border: #2e2c35;
   --primary: #bb86fc; --primary-strong: #bb86fc; --teal: #03dac5; --now-bg: #018786; --now-text: #000;
-  --warn-bg: #400e0f; --agile: #bb86fc; --grid: rgba(255,255,255,0.08); color-scheme: dark;
+  --warn-bg: #400e0f; --agile: #bb86fc; --mine: #b0bec5; --grid: rgba(255,255,255,0.08); color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -202,3 +204,9 @@ details.group[open] > summary::after { transform: rotate(90deg); }
 }
 .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--muted); margin-top: 6px; }
 .legend i { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: -2px; margin-right: 4px; }
+
+.day-head .totals b.mine, .stat.mine .value { color: var(--mine); }
+.yours { font-size: 11px; background: var(--teal-bright); color: #000; border-radius: 4px; padding: 0 5px; margin-left: 3px; vertical-align: 1px; }
+.switch-tag { display: inline-block; font-size: 12px; font-weight: 600; color: var(--primary); border: 1px solid var(--primary); border-radius: 999px; padding: 1px 10px; margin-bottom: 6px; }
+.cheaper { color: var(--teal); font-weight: 600; }
+.dearer { color: #d33; font-weight: 600; }

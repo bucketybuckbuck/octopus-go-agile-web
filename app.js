@@ -22,14 +22,14 @@ const ALL_HOURS = Array.from({ length: 48 }, (_, i) =>
 const DEFAULTS = {
   apiKey: '', accountNumber: '', connected: null, mpan: '', serial: '', region: '',
   elecTariff: '', exportTariff: '', gasTariff: '',
+  elecAgreements: [], exportAgreements: [], gasAgreements: [],
   exportEnabled: false, exportMpan: '', exportSerial: '', exportFixed: 15,
   agileProduct: 'AGILE-24-10-01', goProduct: 'GO-VAR-22-10-14', exportProduct: 'AGILE-OUTGOING-19-05-13',
   smartTariff: false, currentTariff: 'go', highlightBorder: false, showAverage: false, startDay: 1,
-  showPriceNow: false, showDayAverage: false, avgDay: 'today',
-  highlightPrices: false, highThreshold: 30, lowThreshold: 15,
+  showPriceNow: true, showDayAverage: true, avgDay: 'today',
+  highlightPrices: true, autoThresholds: true, highThreshold: 30, lowThreshold: 15,
   timeshift: false, timeshiftHours: ALL_HOURS.slice(), baseload: 0.1, loadThreshold: 1.0, timeshiftAll: false,
-  gas: false, mprn: '', gasSerial: '', gasStanding: 30, gasUnitRate: 6, gasKwh: false,
-  volumeCorrection: 1.02264, calorificValue: 39.4,
+  gas: false, mprn: '', gasSerial: '', gasStanding: 30, gasUnitRate: 6, gasUnit: 'auto', gasDetectedUnit: '',
   theme: 'system',
 };
 
@@ -51,6 +51,11 @@ const store = {
 };
 
 let settings = Object.assign({}, DEFAULTS, store.get('ga:settings', {}));
+// v2: price list options on by default, with automatic thresholds.
+if ((settings.version || 1) < 2) {
+  Object.assign(settings, { version: 2, showPriceNow: true, showDayAverage: true, highlightPrices: true, autoThresholds: true });
+  store.set('ga:settings', settings);
+}
 function saveSettings() { store.set('ga:settings', settings); applyTheme(); }
 function applyTheme() {
   if (settings.theme === 'system') delete document.documentElement.dataset.theme;
@@ -124,11 +129,6 @@ function consumptionUrl(kind, mpan, serial, from, to) {
 /** "E-1R-AGILE-24-10-01-C" → "AGILE-24-10-01"; "G-1R-VAR-22-11-01-C" → "VAR-22-11-01". */
 function productFromCode(code) { return String(code || '').replace(/^[EG]-\d+R-/, '').replace(/-[A-P]$/, ''); }
 function regionFromCode(code) { const m = /-([A-P])$/.exec(code || ''); return m ? m[1] : ''; }
-function gasTariffUrl(kind, from, to) {
-  const code = settings.gasTariff;
-  const range = from ? `?period_from=${iso(from)}&period_to=${iso(to)}&page_size=1500` : '';
-  return `${API}/products/${productFromCode(code)}/gas-tariffs/${code}/${kind}/${range}`;
-}
 function tariffKind(product) {
   if (/^AGILE-OUTGOING/.test(product)) return 'agile-export';
   if (/^AGILE-/.test(product)) return 'agile';
@@ -140,6 +140,38 @@ function tariffKind(product) {
  * Look up the account and fill in meters, serials, region and tariffs.
  * Needs only the API key and account number (A-XXXXXXXX).
  */
+function agreementList(ags) {
+  return (ags || []).filter(a => a.tariff_code).map(a => ({
+    code: a.tariff_code,
+    from: Date.parse(a.valid_from),
+    to: a.valid_to ? Date.parse(a.valid_to) : Infinity,
+  })).sort((a, b) => a.from - b.from);
+}
+/** The tariff you were on at time t (from your account's agreement history). */
+function agreementAt(list, t) {
+  for (let i = (list || []).length - 1; i >= 0; i--) if (list[i].from <= t && t < list[i].to) return list[i].code;
+  return null;
+}
+
+/**
+ * Work out whether the gas meter reports m³ or kWh: compare a year of readings with Octopus's
+ * own annual estimate for the meter (in kWh). kWh meters come out near 1×, m³ meters near 1/11×.
+ */
+async function detectGasUnit(mprn, serial, annualKwh) {
+  const eac = parseFloat(annualKwh);
+  if (!mprn || !serial || !(eac > 0)) return '';
+  const from = Date.now() - 365 * DAY;
+  try {
+    const j = await fetchJson(`${API}/gas-meter-points/${encodeURIComponent(mprn)}/meters/${encodeURIComponent(serial)}/consumption/` +
+      `?period_from=${iso(from)}&group_by=day&page_size=400`, true);
+    const rows = j.results || [];
+    if (rows.length < 14) return '';
+    const total = rows.reduce((a, r) => a + r.consumption, 0);
+    const ratio = (total * 365 / rows.length) / eac;
+    return ratio > 0.3 ? 'kwh' : 'm3';
+  } catch { return ''; }
+}
+
 async function connectAccount() {
   const acct = settings.accountNumber.trim().toUpperCase();
   if (!settings.apiKey || !acct) throw new Error('Enter your API key and account number first.');
@@ -180,6 +212,7 @@ async function connectAccount() {
     settings.serial = await pickSerial('elec', imp.mpan, imp.meters);
     const ag = currentAgreement(imp.agreements);
     settings.elecTariff = ag ? ag.tariff_code : '';
+    settings.elecAgreements = agreementList(imp.agreements);
     if (ag) {
       const product = productFromCode(ag.tariff_code);
       settings.region = regionFromCode(ag.tariff_code) || settings.region;
@@ -199,6 +232,7 @@ async function connectAccount() {
     settings.exportSerial = await pickSerial('elec', exp.mpan, exp.meters);
     const ag = currentAgreement(exp.agreements);
     settings.exportTariff = ag ? ag.tariff_code : '';
+    settings.exportAgreements = agreementList(exp.agreements);
     if (ag) {
       const product = productFromCode(ag.tariff_code);
       summary.exportTariff = await productName(product);
@@ -211,6 +245,7 @@ async function connectAccount() {
   } else {
     settings.exportEnabled = false;
     settings.exportTariff = '';
+    settings.exportAgreements = [];
   }
   const gas = (prop.gas_meter_points || [])[0];
   if (gas) {
@@ -219,9 +254,13 @@ async function connectAccount() {
     settings.gasSerial = await pickSerial('gas', gas.mprn, gas.meters);
     const ag = currentAgreement(gas.agreements);
     settings.gasTariff = ag ? ag.tariff_code : '';
+    settings.gasAgreements = agreementList(gas.agreements);
     if (ag) summary.gasTariff = await productName(productFromCode(ag.tariff_code));
+    settings.gasDetectedUnit = await detectGasUnit(gas.mprn, settings.gasSerial, gas.consumption_standard);
   } else {
     settings.gas = false;
+    settings.gasTariff = '';
+    settings.gasAgreements = [];
   }
   summary.mpan = settings.mpan; summary.region = settings.region;
   summary.exportMpan = exp ? settings.exportMpan : ''; summary.mprn = gas ? settings.mprn : '';
@@ -302,17 +341,21 @@ function css(name) { return getComputedStyle(document.documentElement).getProper
 
 /* ---------------- cost model ---------------- */
 /**
- * Build half-hour items for one day and total up the Agile vs Go costs.
+ * Build half-hour items for one day and total up the costs on Agile, Go and the tariff you
+ * were actually on. `tb` holds per-tariff rate bands (see tariffBands) for that day.
  * Mirrors ChartWrapper.calculateCombinedData / CostSummary from the Android app,
- * but takes Go rates from the API (time-banded) instead of hard-coded windows.
+ * but takes every rate from the API instead of hard-coded windows.
  */
-function computeDay(slots, agileBands, goBands, standing, opts) {
+function computeDay(slots, tb, opts) {
   const isExport = !!opts.isExport;
+  const dayStart = midnight(new Date(slots[0] ? slots[0].t : Date.now())).getTime();
+  const fixedExport = num(settings.exportFixed, 15);
   const items = slots.map(s => ({
     t: s.t,
     kwh: s.kwh,
-    agile: rateAt(agileBands, s.t),
-    go: isExport ? num(settings.exportFixed, 15) : rateAt(goBands, s.t),
+    agile: rateFor(tb.agile, s.t),
+    go: isExport ? fixedExport : rateFor(tb.go, s.t),
+    mine: tb.actual ? rateFor(tb.actual, s.t) : null,
     goKwh: s.kwh,
     shifted: false,
     shiftSource: false,
@@ -320,22 +363,31 @@ function computeDay(slots, agileBands, goBands, standing, opts) {
 
   if (opts.shift && !isExport) applyLoadShift(items);
 
-  let agileCost = 0, goCost = 0, total = 0, agileRateSum = 0, agileRateN = 0;
+  let agileCost = 0, goCost = 0, mineCost = 0, total = 0, agileRateSum = 0, agileRateN = 0;
   for (const it of items) {
     total += it.kwh;
     if (it.agile != null) { agileCost += it.kwh * it.agile; agileRateSum += it.agile; agileRateN++; }
     if (it.go != null) goCost += it.goKwh * it.go;
+    if (it.mine != null) mineCost += it.kwh * it.mine;
   }
-  const energyAgile = agileCost, energyGo = goCost;
-  if (!isExport) { agileCost += standing.agile || 0; goCost += standing.go || 0; }
+  const energyAgile = agileCost, energyGo = goCost, energyMine = mineCost;
+  if (!isExport) {
+    agileCost += standingFor(tb.agile, dayStart);
+    goCost += standingFor(tb.go, dayStart);
+    if (tb.actual) mineCost += standingFor(tb.actual, dayStart);
+  }
   return {
     items, total, agileCost, goCost,
+    mineCost: tb.actual ? mineCost : null,
+    mineName: tb.actualName || null,
+    mineKind: tb.actualKind || null,
+    mineCode: tb.actual ? tb.actual.code : null,
+    mineApprox: !!(tb.actual && tb.actual.twoRate),
     agileAvg: agileRateN ? agileRateSum / agileRateN : null,
-    actualAvg: total ? energyAgile / total : null,
+    actualAvg: total ? (tb.actual ? energyMine : energyAgile) / total : null,
     goAvg: total ? energyGo / total : null,
   };
 }
-
 /**
  * Agile→Go load shift (port of CombinedGestureListener.calculateMoveable):
  * the biggest half-hours above the threshold, within the chosen hours and outside the
@@ -374,34 +426,130 @@ function applyLoadShift(items) {
 }
 
 /* ---------------- data loading ---------------- */
-async function loadStanding() {
-  const [a, g] = await Promise.all([
-    cachedAll('sc', standingUrl(settings.agileProduct), false),
-    cachedAll('sc', standingUrl(settings.goProduct), false),
-  ]);
-  return { agile: toBands(a), go: toBands(g) };
+/** Cached single-object fetch (product details, product lists). Past lookups are kept. */
+async function cachedJson(url, keep) {
+  const key = 'ga:c:json:' + url;
+  const hit = store.get(key, null);
+  if (hit && (keep || Date.now() - hit.t < DAY)) return hit.d;
+  const d = await fetchJson(url, false);
+  store.set(key, { t: Date.now(), d });
+  return d;
 }
 
-/** Load consumption + rates for [from, to) and split them into days. */
-async function loadElectricity(from, to, isExport) {
-  const now = Date.now();
+const nameCache = new Map();
+async function productDisplayName(code) {
+  const p = productFromCode(code);
+  if (!nameCache.has(p)) {
+    nameCache.set(p, cachedJson(`${API}/products/${p}/`, true).then(j => j.display_name || p).catch(() => p));
+  }
+  let name = await nameCache.get(p);
+  if (/^E-2R-/.test(code)) name += ' (Economy 7)';
+  return name;
+}
+
+/** Which Agile / Go product versions were on sale around these dates. */
+const VERSION_RE = { agile: /^AGILE-(FLEX-)?\d/, go: /^GO-(VAR-)?\d/ };
+async function productsAt(t) {
+  const noon = midnight(new Date(t)).getTime() + 12 * 3600e3;
+  const url = `${API}/products/?brand=OCTOPUS_ENERGY&available_at=${iso(noon)}&page_size=200`;
+  const j = await cachedJson(url, noon < Date.now() - 2 * DAY).catch(() => ({ results: [] }));
+  return j.results || [];
+}
+async function versionsFor(kind, days) {
+  const found = new Map();
+  const samples = [days[0], days[days.length - 1]].filter(Boolean).map(d => d.getTime());
+  for (const s of samples) {
+    // Between versions there can be a gap with nothing on sale — step back until one turns up.
+    for (let back = 0, t = s; back < 12; back++, t -= 30 * DAY) {
+      const hits = (await productsAt(t)).filter(p => VERSION_RE[kind].test(p.code));
+      hits.forEach(p => found.set(p.code, Date.parse(p.available_from)));
+      if (hits.length) break;
+    }
+  }
+  return [...found].map(([code, from]) => ({ code, from })).sort((a, b) => a.from - b.from);
+}
+function versionAt(list, t) {
+  if (!list || !list.length) return null;
+  let pick = list[0].code;
+  for (const v of list) if (v.from <= t) pick = v.code;
+  return pick;
+}
+
+/** Unit rates (day/night for Economy 7) and standing charges for one full tariff code. */
+async function tariffBands(code, from, to) {
+  const fuel = code.startsWith('G-') ? 'gas-tariffs' : 'electricity-tariffs';
+  const base = `${API}/products/${productFromCode(code)}/${fuel}/${code}`;
+  const range = `?period_from=${iso(from)}&period_to=${iso(to)}&page_size=1500`;
+  const twoRate = /^E-2R-/.test(code);
+  const isExportTariff = /OUTGOING|EXPORT/.test(code);
+  const [u, n, sc] = await Promise.all([
+    cachedAll('rates', `${base}/${twoRate ? 'day-unit-rates' : 'standard-unit-rates'}/${range}`, false, to),
+    twoRate ? cachedAll('rates', `${base}/night-unit-rates/${range}`, false, to) : Promise.resolve([]),
+    isExportTariff ? Promise.resolve([]) : cachedAll('sc', `${base}/standing-charges/`, false),
+  ]);
+  return { code, twoRate, unit: toBands(u), night: toBands(n), sc: toBands(sc) };
+}
+/** Economy 7 night hours vary by meter; 00:30–07:30 GMT is the most common, so it's used as an estimate. */
+function isE7Night(t) { const d = new Date(t); const m = d.getUTCHours() * 60 + d.getUTCMinutes(); return m >= 30 && m < 450; }
+function rateFor(tb, t) {
+  if (!tb) return null;
+  if (tb.twoRate && isE7Night(t)) return rateAt(tb.night, t);
+  return rateAt(tb.unit, t);
+}
+function standingFor(tb, t) { return tb ? rateAt(tb.sc, t) || 0 : 0; }
+
+/**
+ * Load readings for [from, to) plus, for every day, the rates for:
+ *  - the tariff you were actually on that day (from your account's agreement history),
+ *  - Agile and Go — your own version if you were on it, otherwise the version on sale that day.
+ */
+async function loadPeriod(from, to, days, isExport) {
   const cappedTo = Math.min(to, midnight(addDays(new Date(), 1)).getTime());
   const mpan = isExport ? settings.exportMpan : settings.mpan;
   const serial = isExport ? (settings.exportSerial || settings.serial) : settings.serial;
-  const importProduct = isExport ? settings.exportProduct : settings.agileProduct;
+  const agreements = isExport ? settings.exportAgreements : settings.elecAgreements;
+  const region = settings.region;
 
-  const [cons, agile, go, standing] = await Promise.all([
+  const [cons, agileVersions, goVersions] = await Promise.all([
     cachedAll('cons', consumptionUrl('elec', mpan, serial, from, cappedTo), true, cappedTo),
-    cachedAll('rates', ratesUrl(importProduct, from, cappedTo), false, cappedTo),
-    isExport ? Promise.resolve([]) : cachedAll('rates', ratesUrl(settings.goProduct, from, cappedTo), false, cappedTo),
-    isExport ? Promise.resolve({ agile: [], go: [] }) : loadStanding(),
+    isExport ? Promise.resolve([]) : versionsFor('agile', days),
+    isExport ? Promise.resolve([]) : versionsFor('go', days),
   ]);
+
+  const plan = days.map(d => {
+    const noon = d.getTime() + 12 * 3600e3;
+    const actual = agreementAt(agreements, noon);
+    const kind = actual ? tariffKind(productFromCode(actual)) : null;
+    let agile, go = null;
+    if (isExport) {
+      agile = kind === 'agile-export' ? actual : tariffCode(settings.exportProduct, region);
+    } else {
+      agile = kind === 'agile' ? actual : tariffCode(versionAt(agileVersions, noon) || settings.agileProduct, region);
+      go = kind === 'go' ? actual : tariffCode(versionAt(goVersions, noon) || settings.goProduct, region);
+    }
+    return { day: d.getTime(), actual, kind, agile, go };
+  });
+
+  const codes = [...new Set(plan.flatMap(p => [p.actual, p.agile, p.go]).filter(Boolean))];
+  const bands = new Map();
+  const names = new Map();
+  await Promise.all(codes.map(async c => {
+    bands.set(c, await tariffBands(c, from, cappedTo).catch(() => null));
+    names.set(c, await productDisplayName(c));
+  }));
+
+  const perDay = new Map(plan.map(p => [p.day, {
+    agile: bands.get(p.agile),
+    go: p.go ? bands.get(p.go) : null,
+    actual: p.actual ? bands.get(p.actual) : null,
+    actualKind: p.kind,
+    actualName: p.actual ? names.get(p.actual) : null,
+    agileName: names.get(p.agile),
+    goName: p.go ? names.get(p.go) : null,
+  }]));
   return {
     slots: cons.map(c => ({ t: Date.parse(c.interval_start), kwh: c.consumption })).sort((a, b) => a.t - b.t),
-    agileBands: toBands(agile),
-    goBands: toBands(go),
-    standing,
-    fetchedUntil: Math.min(now, cappedTo),
+    perDay,
   };
 }
 
@@ -466,6 +614,8 @@ function dayChart(canvas, day, opts) {
           borderColor: css('--agile'), borderWidth: 1.5, pointRadius: 0, order: 1 },
         { type: 'line', label: goLabel, data: items.map(i => i.go), yAxisID: 'y1', stepped: 'middle',
           borderColor: css('--go'), borderWidth: 1.5, pointRadius: 0, order: 2 },
+        ...(day.mineCost != null && !mineColumn(day, isExport) ? [{ type: 'line', label: (day.mineName || 'Yours') + ' ' + pounds(day.mineCost), data: items.map(i => i.mine), yAxisID: 'y1', stepped: 'middle',
+          borderColor: css('--mine'), borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, order: 0 }] : []),
         { type: 'bar', label: day.anyShift ? 'Usage (shifted)' : 'Usage', data: items.map(i => i.goKwh),
           backgroundColor: colors, yAxisID: 'y', order: 3, barPercentage: 1, categoryPercentage: 0.9 },
       ],
@@ -518,6 +668,27 @@ function priceShade(p) {
   return `background:rgba(3,218,197,${(1 - x / 0.5).toFixed(2)})`;
 }
 
+/**
+ * Automatic price-list thresholds: over the last week of Agile prices (plus today/tomorrow),
+ * the cheapest quarter of half-hours counts as "low" and the dearest quarter as "high".
+ */
+async function updateAutoThresholds(upcoming) {
+  const today = midnight(new Date()).getTime();
+  const from = addDays(new Date(today), -7).getTime();
+  let past = [];
+  try { past = await cachedAll('rates', ratesUrl(settings.agileProduct, from, today), false, today); } catch { /* use what we have */ }
+  const ps = past.map(r => r.value_inc_vat).concat(upcoming.map(x => x.p)).sort((a, b) => a - b);
+  if (ps.length < 48) return;
+  const q = f => ps[Math.min(ps.length - 1, Math.floor(f * ps.length))];
+  const round = v => Math.round(v * 2) / 2;
+  const low = round(q(0.25)), high = Math.max(low + 0.5, round(q(0.75)));
+  if (low !== settings.lowThreshold || high !== settings.highThreshold) {
+    settings.lowThreshold = low;
+    settings.highThreshold = high;
+    saveSettings();
+  }
+}
+
 async function renderHome(token) {
   setPeriodNav(false);
   const el = view();
@@ -548,6 +719,10 @@ async function renderHome(token) {
     const raw = await cachedAll('home', ratesUrl(settings.agileProduct, from, to), false);
     if (token !== renderToken) return;
     const prices = raw.map(r => ({ t: Date.parse(r.valid_from), p: r.value_inc_vat })).sort((a, b) => a.t - b.t);
+    if (settings.highlightPrices && settings.autoThresholds) {
+      await updateAutoThresholds(prices);
+      if (token !== renderToken) return;
+    }
     renderPriceList(prices);
     renderPriceChart(prices);
   } catch (e) {
@@ -564,14 +739,13 @@ async function renderHome(token) {
   const yStart = addDays(today, -1);
   document.getElementById('yesterday-title').textContent = 'Yesterday · ' + fmtDayLong.format(yStart);
   try {
-    const data = await loadElectricity(yStart.getTime(), today.getTime(), false);
+    const data = await loadPeriod(yStart.getTime(), today.getTime(), [yStart], false);
     if (token !== renderToken) return;
     if (data.slots.length < 3) {
       body.textContent = "Yesterday's smart meter readings haven't arrived yet — Octopus usually publishes them within a day.";
       return;
     }
-    const sc = { agile: rateAt(data.standing.agile, yStart.getTime()), go: rateAt(data.standing.go, yStart.getTime()) };
-    const day = computeDay(data.slots, data.agileBands, data.goBands, sc, { shift: settings.timeshift && settings.timeshiftAll });
+    const day = computeDay(data.slots, data.perDay.get(yStart.getTime()), { shift: settings.timeshift && settings.timeshiftAll });
     body.outerHTML = dayCardInner(day, yStart, false) +
       `<div class="chart-box"><canvas id="yesterday-chart"></canvas></div>`;
     paintWarn(document.getElementById('yesterday-card'), day, false);
@@ -634,24 +808,51 @@ function renderPriceChart(prices) {
 }
 
 /* ---- History ---- */
-function dayCardInner(day, date, isExport) {
+/** Is the tariff you were on one of the two columns already shown (Agile / Go)? */
+function mineColumn(day, isExport) {
+  if (day.mineCost == null) return null;
+  if (isExport) return day.mineKind === 'agile-export' ? 'agile' : null;
+  return day.mineKind === 'agile' ? 'agile' : day.mineKind === 'go' ? 'go' : null;
+}
+
+function signedDiff(alt, paid, isExport) {
+  // Positive = the alternative would have been better for you.
+  const better = isExport ? alt - paid : paid - alt;
+  if (Math.abs(better) < 0.5) return '<span class="muted">about the same</span>';
+  return `<span class="${better > 0 ? 'cheaper' : 'dearer'}">${pounds(Math.abs(better))} ${isExport ? (better > 0 ? 'more' : 'less') : (better > 0 ? 'cheaper' : 'dearer')}</span>`;
+}
+
+function dayCardInner(day, date, isExport, switched) {
   const a = isExport ? 'Agile Outgoing' : 'Agile';
   const g = isExport ? 'Fixed' : 'Go';
+  const col = mineColumn(day, isExport);
+  const tag = k => (col === k ? ' <span class="yours">yours</span>' : '');
+  const mine = day.mineCost != null && !col
+    ? `<b class="mine">${isExport ? 'You earned' : 'You paid'} ${pounds(day.mineCost)}</b> <span class="muted">(${esc(day.mineName || 'your tariff')}${day.mineApprox ? ', approx.' : ''})</span> · `
+    : '';
   let avg = '';
   if (settings.showAverage && day.total > 0) {
     avg = `<div class="small muted">Agile avg rate ${pence(day.agileAvg)} · your avg ${pence(day.actualAvg)} · ${g} avg ${pence(day.goAvg)}</div>`;
   }
-  return `<div class="day-head">
-      <span class="totals"><b class="agile">${a} ${pounds(day.agileCost)}</b> · <b class="go">${g} ${pounds(day.goCost)}</b> · ${kwh(day.total)}</span>
+  return `${switched ? `<div class="switch-tag">Switched to ${esc(switched)}</div>` : ''}<div class="day-head">
+      <span class="totals">${mine}<b class="agile">${a} ${pounds(day.agileCost)}</b>${tag('agile')} · <b class="go">${g} ${pounds(day.goCost)}</b>${tag('go')} · ${kwh(day.total)}</span>
     </div>${avg}`;
 }
 
-/** "Graph warning highlight": flag days where the tariff you're not on would have been cheaper. */
+/** Warning highlight: flag days where Agile or Go would have beaten the tariff you were on. */
 function paintWarn(card, day, isExport) {
   card.classList.remove('warn', 'warn-border');
   if (!settings.smartTariff || isExport || !day.total) return;
-  const onGo = settings.currentTariff === 'go';
-  const bad = onGo ? day.agileCost < day.goCost : day.goCost < day.agileCost;
+  let bad;
+  if (day.mineCost != null) {
+    const alts = [];
+    if (day.mineKind !== 'agile') alts.push(day.agileCost);
+    if (day.mineKind !== 'go') alts.push(day.goCost);
+    bad = alts.length && Math.min(...alts) < day.mineCost - 0.5;
+  } else {
+    const onGo = settings.currentTariff === 'go';
+    bad = onGo ? day.agileCost < day.goCost : day.goCost < day.agileCost;
+  }
   if (bad) card.classList.add(settings.highlightBorder ? 'warn-border' : 'warn');
 }
 
@@ -671,7 +872,7 @@ async function renderHistory(token) {
   const days = daysIn(period.start, period.end).filter(d => d <= new Date());
   let data;
   try {
-    data = await loadElectricity(period.start.getTime(), period.end.getTime(), isExport);
+    data = await loadPeriod(period.start.getTime(), period.end.getTime(), days, isExport);
   } catch (e) {
     if (token !== renderToken) return;
     el.innerHTML = errorBox(e);
@@ -682,15 +883,18 @@ async function renderHistory(token) {
   const byDay = splitByDay(data.slots, days);
   const shiftAll = settings.timeshift && settings.timeshiftAll;
   const results = [];
+  let prevCode = null;
   for (const d of days) {
     const slots = byDay.get(d.getTime()) || [];
-    if (slots.length < 3) { results.push({ date: d, day: null }); continue; }
-    const sc = isExport ? {} : { agile: rateAt(data.standing.agile, d.getTime()), go: rateAt(data.standing.go, d.getTime()) };
-    const plain = computeDay(slots, data.agileBands, data.goBands, sc, { isExport });
-    const shifted = settings.timeshift && !isExport
-      ? computeDay(slots, data.agileBands, data.goBands, sc, { isExport, shift: true }) : null;
+    const tb = data.perDay.get(d.getTime());
+    const code = tb && tb.actual ? tb.actual.code : null;
+    const switched = prevCode && code && code !== prevCode ? tb.actualName : null;
+    if (code) prevCode = code;
+    if (slots.length < 3 || !tb || !tb.agile) { results.push({ date: d, day: null }); continue; }
+    const plain = computeDay(slots, tb, { isExport });
+    const shifted = settings.timeshift && !isExport ? computeDay(slots, tb, { isExport, shift: true }) : null;
     if (shifted) shifted.anyShift = shifted.items.some(i => i.shifted);
-    results.push({ date: d, day: plain, shifted, showShift: shiftAll });
+    results.push({ date: d, day: plain, shifted, showShift: shiftAll, switched });
   }
 
   renderSummary(results, isExport);
@@ -714,7 +918,7 @@ async function renderHistory(token) {
   const draw = card => {
     const r = withData[+card.dataset.i];
     const day = r.showShift && r.shifted ? r.shifted : r.day;
-    card.querySelector('.day-body').innerHTML = dayCardInner(day, r.date, isExport);
+    card.querySelector('.day-body').innerHTML = dayCardInner(day, r.date, isExport, r.switched);
     paintWarn(card, day, isExport);
     if (drawn.has(card)) { const old = drawn.get(card); charts.delete(old); old.destroy(); }
     drawn.set(card, dayChart(card.querySelector('canvas'), day, { isExport }));
@@ -739,58 +943,108 @@ async function renderHistory(token) {
 }
 const observers = [];
 
+/** "Octopus Go (1–9 Nov), Agile Octopus (10–17 Nov)" */
+function tariffTimeline(days) {
+  const runs = [];
+  for (const r of days) {
+    const name = r.day.mineName;
+    if (!name) continue;
+    const last = runs[runs.length - 1];
+    if (last && last.name === name) last.to = r.date; else runs.push({ name, from: r.date, to: r.date });
+  }
+  if (runs.length <= 1) return runs.length ? esc(runs[0].name) : '';
+  return runs.map(x => `${esc(x.name)} (${fmtShort.format(x.from)}–${fmtShort.format(x.to)})`).join(', ');
+}
+
 function renderSummary(results, isExport) {
   const days = results.filter(r => r.day);
-  const sum = (f) => days.reduce((a, r) => a + f(r), 0);
-  const agile = sum(r => r.day.agileCost);
-  const go = sum(r => r.day.goCost);
-  const goShift = settings.timeshift && !isExport ? sum(r => (r.shifted || r.day).goCost) : null;
-  const total = sum(r => r.day.total);
-  const a = isExport ? 'Agile Outgoing' : 'Agile';
-  const g = isExport ? 'Fixed export' : 'Go';
-  const bestAgile = isExport ? agile > go : agile < go;
-  const diff = Math.abs(agile - go);
-  const winner = bestAgile ? a : g;
   const card = document.getElementById('summary');
   if (!days.length) {
     card.innerHTML = `<h2>${isExport ? 'Export' : 'Usage'} summary</h2><p class="muted">No readings in this period.</p>`;
     return;
   }
+  const sum = (list, f) => list.reduce((a, r) => a + f(r), 0);
+  const agile = sum(days, r => r.day.agileCost);
+  const go = sum(days, r => r.day.goCost);
+  const goShift = settings.timeshift && !isExport ? sum(days, r => (r.shifted || r.day).goCost) : null;
+  const total = sum(days, r => r.day.total);
+  const a = isExport ? 'Agile Outgoing' : 'Agile';
+  const g = isExport ? 'Fixed export' : 'Go';
+
+  // What you actually paid, over the days we know your tariff for.
+  const known = days.filter(r => r.day.mineCost != null);
+  const paid = sum(known, r => r.day.mineCost);
+  const agileKnown = sum(known, r => r.day.agileCost);
+  const goKnown = sum(known, r => r.day.goCost);
+  const allKnown = known.length === days.length;
+  const timeline = tariffTimeline(days);
+
+  const bestAgile = isExport ? agile > go : agile < go;
   const agileRates = days.map(r => r.day.agileAvg).filter(x => x != null);
-  const energyAgile = sum(r => r.day.items.reduce((s, i) => s + (i.agile ?? 0) * i.kwh, 0));
+  const energyMine = sum(days, r => r.day.actualAvg != null ? r.day.actualAvg * r.day.total : 0);
+
+  let verdict;
+  if (known.length) {
+    verdict = `<p class="small" style="margin:10px 0 0">${isExport ? 'Compared with what you earned' : 'Compared with what you paid'}${allKnown ? '' : ` (on the ${known.length} days your tariff is known)`}:
+      <b>${a}</b> would have been ${signedDiff(agileKnown, paid, isExport)}, <b>${g}</b> ${signedDiff(goKnown, paid, isExport)}${isExport ? '' : ' — standing charges included'}.</p>`;
+  } else {
+    const winner = bestAgile ? a : g;
+    verdict = `<p class="small" style="margin:10px 0 0"><b>${esc(winner)}</b> ${isExport ? 'paid' : 'was cheaper'} by <b>${pounds(Math.abs(agile - go))}</b> over this period${isExport ? '' : ' (standing charges included)'}.</p>`;
+  }
+
   card.innerHTML = `
     <h2>${isExport ? 'Export' : 'Usage'} summary · ${days.length} day${days.length > 1 ? 's' : ''}</h2>
+    ${timeline ? `<p class="small muted" style="margin:-4px 0 10px">Your tariff: ${timeline}</p>` : ''}
     <div class="stats">
-      <div class="stat agile ${bestAgile ? 'best' : ''}"><div class="label">${a}${isExport ? ' earnings' : ' cost'}</div><div class="value">${pounds(agile)}</div></div>
-      <div class="stat go ${!bestAgile ? 'best' : ''}"><div class="label">${g}${isExport ? ' earnings' : ' cost'}</div><div class="value">${pounds(go)}</div></div>
+      ${known.length ? `<div class="stat mine"><div class="label">${isExport ? 'You earned' : 'You paid'}${allKnown ? '' : ` (${known.length} days)`}</div><div class="value">${pounds(paid)}</div></div>` : ''}
+      <div class="stat agile ${!known.length && bestAgile ? 'best' : ''}"><div class="label">${a}${isExport ? ' earnings' : ' cost'}</div><div class="value">${pounds(agile)}</div></div>
+      <div class="stat go ${!known.length && !bestAgile ? 'best' : ''}"><div class="label">${g}${isExport ? ' earnings' : ' cost'}</div><div class="value">${pounds(go)}</div></div>
       <div class="stat"><div class="label">${isExport ? 'Exported' : 'Used'}</div><div class="value">${total.toFixed(1)} kWh</div></div>
-      <div class="stat"><div class="label">Your avg rate${isExport ? '' : ' (excl. standing)'}</div><div class="value">${pence(total ? energyAgile / total : null)}</div></div>
+      <div class="stat"><div class="label">Your avg rate${isExport ? '' : ' (excl. standing)'}</div><div class="value">${pence(total ? energyMine / total : null)}</div></div>
       <div class="stat"><div class="label">Agile avg unit rate</div><div class="value">${pence(agileRates.length ? agileRates.reduce((x, y) => x + y, 0) / agileRates.length : null)}</div></div>
       ${goShift != null ? `<div class="stat go"><div class="label">Go with load shift</div><div class="value">${pounds(goShift)}</div></div>` : ''}
     </div>
-    <p class="small" style="margin:10px 0 0"><b>${esc(winner)}</b> ${isExport ? 'paid' : 'was cheaper'} by <b>${pounds(diff)}</b> over this period${isExport ? '' : ' (standing charges included)'}.</p>
+    ${verdict}
     <div class="chart-box" style="height:200px;margin-top:10px"><canvas id="summary-chart"></canvas></div>`;
 
   const o = baseChartOptions();
   o.plugins.tooltip = { callbacks: { label: c => ` ${c.dataset.label}: ${pounds(c.parsed.y * 100)}` } };
   o.scales.y.ticks.callback = v => '£' + v;
-  const chrono = days.slice();
+  const datasets = [];
+  if (known.length) {
+    datasets.push({ label: isExport ? 'You earned' : 'You paid', data: days.map(r => (r.day.mineCost != null ? r.day.mineCost / 100 : null)), backgroundColor: css('--mine') });
+  }
+  datasets.push(
+    { label: a, data: days.map(r => r.day.agileCost / 100), backgroundColor: css('--agile') },
+    { label: g, data: days.map(r => r.day.goCost / 100), backgroundColor: css('--go') },
+  );
   charts.add(new Chart(document.getElementById('summary-chart'), {
     type: 'bar',
-    data: {
-      labels: chrono.map(r => fmtShort.format(r.date)),
-      datasets: [
-        { label: a, data: chrono.map(r => r.day.agileCost / 100), backgroundColor: css('--agile') },
-        { label: g, data: chrono.map(r => r.day.goCost / 100), backgroundColor: css('--go') },
-      ],
-    },
+    data: { labels: days.map(r => fmtShort.format(r.date)), datasets },
     options: o,
   }));
 }
 
 /* ---- Gas ---- */
+function gasTimeline(results) {
+  const runs = [];
+  for (const r of results) {
+    if (!r.tariff) continue;
+    const last = runs[runs.length - 1];
+    if (last && last.name === r.tariff) last.to = r.date; else runs.push({ name: r.tariff, from: r.date, to: r.date });
+  }
+  if (runs.length <= 1) return runs.length ? esc(runs[0].name) : '';
+  return runs.map(x => `${esc(x.name)} (${fmtShort.format(x.from)}–${fmtShort.format(x.to)})`).join(', ');
+}
+
+/** Readings arrive in m³ (most SMETS2 meters) or kWh (most SMETS1). */
+function gasUnit() {
+  if (settings.gasUnit === 'm3' || settings.gasUnit === 'kwh') return settings.gasUnit;
+  return settings.gasDetectedUnit || 'm3';
+}
+/** m³ → kWh using the standard volume correction (1.02264) and a typical UK calorific value (39.4 MJ/m³). */
 function gasKwh(v) {
-  return settings.gasKwh ? v : (v * num(settings.volumeCorrection, 1.02264) * num(settings.calorificValue, 39.4)) / 3.6;
+  return gasUnit() === 'kwh' ? v : (v * 1.02264 * 39.4) / 3.6;
 }
 
 async function renderGas(token) {
@@ -806,15 +1060,18 @@ async function renderGas(token) {
   el.innerHTML = `<section class="card" id="gas-summary"><h2>Gas summary</h2><div class="muted small">Loading…</div></section><div id="gas-days"></div>`;
   const days = daysIn(period.start, period.end).filter(d => d <= new Date());
   const to = Math.min(period.end.getTime(), midnight(addDays(new Date(), 1)).getTime());
-  let cons, unitBands = [], scBands = [];
+  // The gas tariff you were on each day (from your account), falling back to your current one.
+  const codeFor = d => agreementAt(settings.gasAgreements, d.getTime() + 12 * 3600e3) || settings.gasTariff || null;
+  const codes = [...new Set(days.map(codeFor).filter(Boolean))];
+  const bands = new Map(), names = new Map();
+  let cons;
   try {
-    const gasRates = settings.gasTariff ? Promise.all([
-      cachedAll('rates', gasTariffUrl('standard-unit-rates', period.start.getTime(), to), false, to),
-      cachedAll('sc', gasTariffUrl('standing-charges'), false),
-    ]).catch(() => [[], []]) : Promise.resolve([[], []]);
-    [cons, [unitBands, scBands]] = await Promise.all([
+    [cons] = await Promise.all([
       cachedAll('gas', consumptionUrl('gas', settings.mprn, settings.gasSerial, period.start.getTime(), to), true, to),
-      gasRates.then(([u, s]) => [toBands(u), toBands(s)]),
+      ...codes.map(async c => {
+        bands.set(c, await tariffBands(c, period.start.getTime(), to).catch(() => null));
+        names.set(c, await productDisplayName(c));
+      }),
     ]);
   } catch (e) {
     if (token !== renderToken) return;
@@ -822,10 +1079,11 @@ async function renderGas(token) {
     return;
   }
   if (token !== renderToken) return;
-  const useTariff = unitBands.length > 0;
   const manualUnit = num(settings.gasUnitRate, 6), manualSc = num(settings.gasStanding, 30);
-  const unitAt = t => (useTariff ? rateAt(unitBands, t) ?? manualUnit : manualUnit);
-  const scAt = t => (useTariff ? rateAt(scBands, t) ?? manualSc : manualSc);
+  const tbAt = t => bands.get(codeFor(midnight(new Date(t))));
+  const useTariff = codes.some(c => bands.get(c) && bands.get(c).unit.length);
+  const unitAt = t => { const tb = tbAt(t); return (tb && rateAt(tb.unit, t)) ?? manualUnit; };
+  const scAt = t => { const tb = tbAt(t); return (tb && rateAt(tb.sc, t)) ?? manualSc; };
   const slots = cons.map(c => {
     const t = Date.parse(c.interval_start);
     return { t, kwh: gasKwh(c.consumption), p: unitAt(t) };
@@ -835,7 +1093,7 @@ async function renderGas(token) {
     const s = byDay.get(d.getTime()) || [];
     const total = s.reduce((a, x) => a + x.kwh, 0);
     const energy = s.reduce((a, x) => a + x.kwh * x.p, 0);
-    return { date: d, slots: s, total, cost: s.length ? energy + scAt(d.getTime()) : 0 };
+    return { date: d, slots: s, total, cost: s.length ? energy + scAt(d.getTime()) : 0, tariff: names.get(codeFor(d)) || '' };
   }).filter(r => r.slots.length);
   const lastDay = results.length ? results[results.length - 1].date.getTime() : Date.now();
   const unit = unitAt(lastDay), sc = scAt(lastDay);
@@ -850,7 +1108,7 @@ async function renderGas(token) {
       <div class="stat"><div class="label">Used</div><div class="value">${total.toFixed(1)} kWh</div></div>
       <div class="stat"><div class="label">Daily average</div><div class="value">${pounds(cost / results.length)}</div></div>
     </div>
-    <p class="small muted" style="margin:8px 0 0">${useTariff ? `Your tariff (${esc(productFromCode(settings.gasTariff))}): currently` : 'At'} ${pence(unit)}/kWh and ${pence(sc)}/day standing charge${settings.gasKwh ? '' : `; m³ converted with volume correction ${settings.volumeCorrection} and calorific value ${settings.calorificValue}`}.</p>`;
+    <p class="small muted" style="margin:8px 0 0">${useTariff ? `Your tariff: ${gasTimeline(results)} — latest ` : 'At '}${pence(unit)}/kWh and ${pence(sc)}/day standing charge. Readings in ${gasUnit() === 'kwh' ? 'kWh' : 'm³, converted to kWh'}.</p>`;
 
   const gasEl = document.getElementById('gas-days');
   const list = results.slice().reverse();
@@ -1137,8 +1395,8 @@ function renderSettings() {
 
     ${section('compare', 'Comparison', `Billing starts day ${esc(settings.startDay)}${settings.smartTariff ? ' · warnings on' : ''}`, `
       ${field('startDay', 'Billing start day', 'number', { hint: 'Day of the month your bill starts (1–28)' })}
-      ${field('smartTariff', 'Warn on dearer days', 'checkbox', { hint: 'Highlight days where the other tariff would have been cheaper' })}
-      ${field('currentTariff', "Tariff you're on", 'select', { dep: 'smartTariff', options: [['go', 'Go'], ['agile', 'Agile']] })}
+      ${field('smartTariff', 'Warn on dearer days', 'checkbox', { hint: 'Highlight days where Agile or Go would have been cheaper than the tariff you were on' })}
+      ${(settings.elecAgreements || []).length ? '' : field('currentTariff', "Tariff you're on", 'select', { dep: 'smartTariff', hint: 'Connect your account and this is worked out day by day instead', options: [['go', 'Go'], ['agile', 'Agile']] })}
       ${field('highlightBorder', 'Highlight with border', 'checkbox', { dep: 'smartTariff', hint: 'Off = shaded background' })}
       ${field('showAverage', 'Show average unit rates', 'checkbox', { hint: "Agile's average price vs the average you actually paid" })}
       ${field('exportFixed', 'Fixed export price (p/kWh)', 'number', { dep: 'exportEnabled', hint: 'Compared against Agile Outgoing' })}
@@ -1149,8 +1407,10 @@ function renderSettings() {
       ${field('showDayAverage', 'Show avg / min / max', 'checkbox')}
       ${field('avgDay', 'For', 'select', { dep: 'showDayAverage', options: [['today', 'Today'], ['tomorrow', 'Tomorrow']] })}
       ${field('highlightPrices', 'Colour prices', 'checkbox', { hint: 'Green below the low threshold, red above the high one' })}
-      ${field('lowThreshold', 'Low threshold (p)', 'number', { dep: 'highlightPrices' })}
-      ${field('highThreshold', 'High threshold (p)', 'number', { dep: 'highlightPrices' })}
+      ${field('autoThresholds', 'Set thresholds automatically', 'checkbox', { dep: 'highlightPrices',
+        hint: `From the last week of Agile prices: cheapest quarter green, dearest quarter red. Currently below ${pence(num(settings.lowThreshold, 15))} / above ${pence(num(settings.highThreshold, 30))}.` })}
+      ${field('lowThreshold', 'Low threshold (p)', 'number', { dep: 'highlightPrices&!autoThresholds' })}
+      ${field('highThreshold', 'High threshold (p)', 'number', { dep: 'highlightPrices&!autoThresholds' })}
     `, openGroups.has('home'))}
 
     ${section('shift', 'Load shift', settings.timeshift ? 'on' : 'off', `
@@ -1163,20 +1423,25 @@ function renderSettings() {
         <div class="hours-grid">${ALL_HOURS.map(h => `<label><input type="checkbox" name="hour" value="${h}" ${hours.has(h) ? 'checked' : ''}>${h}</label>`).join('')}</div></div>
     `, openGroups.has('shift'))}
 
-    ${section('gasopts', 'Gas', settings.gas ? (settings.gasTariff ? 'rates from your tariff' : 'manual rates') : 'off', `
+    ${section('gasopts', 'Gas', settings.gas ? `readings in ${gasUnit() === 'kwh' ? 'kWh' : 'm³'}${settings.gasTariff ? '' : ' · manual prices'}` : 'off', `
       <p class="small muted" data-dep-off="gas" style="margin:0">No gas meter set up. Connect your account, or turn on "Gas meter" under Meter details.</p>
-      ${field('gasKwh', 'Meter reports kWh', 'checkbox', { dep: 'gas', hint: 'Usually on for SMETS1 meters, off for SMETS2 (m³). If gas use looks ~11× too low or high, flip this.' })}
-      ${settings.gasTariff ? `<p class="small muted">Unit rate and standing charge come from your tariff (${esc(productFromCode(settings.gasTariff))}). The values below are only used if that lookup fails.</p>` : ''}
-      ${field('gasUnitRate', 'Unit rate (p/kWh)', 'number', { dep: 'gas' })}
-      ${field('gasStanding', 'Standing charge (p/day)', 'number', { dep: 'gas' })}
-      ${field('volumeCorrection', 'Volume correction', 'number', { dep: 'gas' })}
-      ${field('calorificValue', 'Calorific value', 'number', { dep: 'gas' })}
+      ${field('gasUnit', 'Gas readings', 'select', { dep: 'gas',
+        hint: 'Leave on Automatic. Only change it if your gas use looks about 11× too high or low.',
+        options: [
+          ['auto', `Automatic${settings.gasDetectedUnit ? ` (detected: ${settings.gasDetectedUnit === 'kwh' ? 'kWh' : 'm³'})` : ' (m³ assumed)'}`],
+          ['m3', 'm³ — most newer (SMETS2) meters'],
+          ['kwh', 'kWh — most older (SMETS1) meters'],
+        ] })}
+      ${settings.gasTariff ? '' : `
+        <p class="small muted">Your gas tariff isn't known, so enter its prices. Connecting your account fills these in automatically.</p>
+        ${field('gasUnitRate', 'Unit rate (p/kWh)', 'number', { dep: 'gas' })}
+        ${field('gasStanding', 'Standing charge (p/day)', 'number', { dep: 'gas' })}`}
     `, openGroups.has('gasopts'))}
 
     ${section('advanced', 'Advanced', esc(`${settings.agileProduct} vs ${settings.goProduct}`), `
-      <p class="small muted" style="margin:0 0 6px">The Octopus products being compared. Your own tariff is picked up when you connect.</p>
-      ${field('agileProduct', 'Agile product')}
-      ${field('goProduct', 'Go product')}
+      <p class="small muted" style="margin:0 0 6px">History compares against the Agile and Go versions that were on sale on each date (or your own, if you were on one). These are only used if that lookup fails.</p>
+      ${field('agileProduct', 'Fallback Agile product')}
+      ${field('goProduct', 'Fallback Go product')}
       ${field('exportProduct', 'Agile Outgoing product', 'text', { dep: 'exportEnabled' })}
       <div class="row" style="padding:4px 0"><button type="button" class="btn secondary" id="detect-products">Use latest Octopus products</button></div>
       ${field('theme', 'Theme', 'select', { options: [['system', 'Match system'], ['light', 'Light'], ['dark', 'Dark']] })}
@@ -1189,11 +1454,16 @@ function renderSettings() {
   </form>`;
 
   const form = document.getElementById('settings-form');
-  const syncDeps = () => form.querySelectorAll('[data-dep]').forEach(f => {
-    const on = !!settings[f.dataset.dep];
+  const syncDeps = () => {
+    syncFieldDeps();
+    form.querySelectorAll('[data-dep-off]').forEach(p => { p.hidden = !!settings[p.dataset.depOff]; });
+  };
+  const syncFieldDeps = () => form.querySelectorAll('[data-dep]').forEach(f => {
+    // data-dep: 'a', '!a' or 'a&!b' — shown only while every condition holds.
+    const on = f.dataset.dep.split('&').every(k => (k[0] === '!' ? !settings[k.slice(1)] : !!settings[k]));
     f.classList.toggle('disabled', !on);
     f.querySelectorAll('input,select').forEach(i => { i.disabled = !on; });
-  }) || form.querySelectorAll('[data-dep-off]').forEach(p => { p.hidden = !!settings[p.dataset.depOff]; });
+  });
   syncDeps();
   renderCurrentRates();
 
