@@ -147,6 +147,15 @@ main { max-width: 960px; margin: 0 auto; padding: 16px; }
 .connected .kv { display: flex; gap: 10px; padding: 2px 0; }
 .connected .kv span { color: var(--muted); min-width: 80px; }
 .connected .kv b { font-weight: 500; overflow-wrap: anywhere; }
+.rates:empty { display: none; }
+.rates { margin-top: 12px; }
+.rates h3 { font-size: 14px; margin: 0 0 6px; }
+.rate-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; font-size: 14px; }
+.rate-head { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
+.rate-head .muted { font-size: 13px; }
+.rate-card .kv { display: grid; grid-template-columns: 76px 1fr; gap: 8px; padding: 3px 0; font-variant-numeric: tabular-nums; }
+.rate-card .kv > span { color: var(--muted); font-size: 13px; }
+.now-tag { font-size: 11px; background: var(--teal-bright); color: #000; border-radius: 4px; padding: 0 5px; margin-left: 4px; }
 details.group { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 10px; }
 details.group > summary {
   list-style: none; cursor: pointer; padding: 12px 14px; display: flex; justify-content: space-between; align-items: baseline; gap: 12px;

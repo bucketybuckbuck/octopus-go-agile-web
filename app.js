@@ -20,7 +20,8 @@ const ALL_HOURS = Array.from({ length: 48 }, (_, i) =>
   `${String(Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`);
 
 const DEFAULTS = {
-  apiKey: '', accountNumber: '', connected: null, mpan: '', serial: '', region: '', gasTariff: '',
+  apiKey: '', accountNumber: '', connected: null, mpan: '', serial: '', region: '',
+  elecTariff: '', exportTariff: '', gasTariff: '',
   exportEnabled: false, exportMpan: '', exportSerial: '', exportFixed: 15,
   agileProduct: 'AGILE-24-10-01', goProduct: 'GO-VAR-22-10-14', exportProduct: 'AGILE-OUTGOING-19-05-13',
   smartTariff: false, currentTariff: 'go', highlightBorder: false, showAverage: false, startDay: 1,
@@ -178,6 +179,7 @@ async function connectAccount() {
     settings.mpan = imp.mpan;
     settings.serial = await pickSerial('elec', imp.mpan, imp.meters);
     const ag = currentAgreement(imp.agreements);
+    settings.elecTariff = ag ? ag.tariff_code : '';
     if (ag) {
       const product = productFromCode(ag.tariff_code);
       settings.region = regionFromCode(ag.tariff_code) || settings.region;
@@ -196,6 +198,7 @@ async function connectAccount() {
     settings.exportMpan = exp.mpan;
     settings.exportSerial = await pickSerial('elec', exp.mpan, exp.meters);
     const ag = currentAgreement(exp.agreements);
+    settings.exportTariff = ag ? ag.tariff_code : '';
     if (ag) {
       const product = productFromCode(ag.tariff_code);
       summary.exportTariff = await productName(product);
@@ -207,6 +210,7 @@ async function connectAccount() {
     }
   } else {
     settings.exportEnabled = false;
+    settings.exportTariff = '';
   }
   const gas = (prop.gas_meter_points || [])[0];
   if (gas) {
@@ -231,7 +235,8 @@ async function connectAccount() {
 
 /** Normalise rate results into sorted bands {from, to, p}. */
 function toBands(results) {
-  return results.map(r => ({
+  const hasDD = results.some(r => r.payment_method === 'DIRECT_DEBIT');
+  return results.filter(r => !hasDD || r.payment_method === 'DIRECT_DEBIT' || r.payment_method == null).map(r => ({
     from: Date.parse(r.valid_from),
     to: r.valid_to ? Date.parse(r.valid_to) : Infinity,
     p: r.value_inc_vat,
@@ -897,6 +902,143 @@ function section(id, title, summary, body, open) {
 
 function regionName(code) { const r = REGIONS.find(([c]) => c === code); return r ? `${r[1]} (${code})` : '—'; }
 
+/* ---- Current tariff rates (Settings) ---- */
+function tariffBase(code) {
+  const fuel = code.startsWith('G-') ? 'gas-tariffs' : 'electricity-tariffs';
+  return `${API}/products/${productFromCode(code)}/${fuel}/${code}`;
+}
+
+/** Load today's + tomorrow's unit rates and the standing charge for a full tariff code. */
+async function loadTariffRates(code) {
+  const today = midnight(new Date()).getTime();
+  const to = addDays(new Date(today), 2).getTime();
+  const range = `?period_from=${iso(today)}&period_to=${iso(to)}&page_size=1500`;
+  const base = tariffBase(code);
+  const twoRate = /^E-2R-/.test(code);
+  const [a, b, sc] = await Promise.all([
+    cachedAll('rates', `${base}/${twoRate ? 'day-unit-rates' : 'standard-unit-rates'}/${range}`, false),
+    twoRate ? cachedAll('rates', `${base}/night-unit-rates/${range}`, false) : Promise.resolve([]),
+    code.startsWith('E-') && /OUTGOING|EXPORT/.test(code) ? Promise.resolve([]) : cachedAll('sc', `${base}/standing-charges/`, false),
+  ]);
+  return { twoRate, unit: toBands(a), night: toBands(b), standing: rateAt(toBands(sc), Date.now()) };
+}
+
+/**
+ * Describe a set of rate bands in the way that suits the tariff:
+ * half-hourly (Agile), daily (Tracker), time-of-use windows (Go) or a single flat rate.
+ */
+function describeUnitRates(bands) {
+  const now = Date.now();
+  const today = midnight(new Date()).getTime();
+  const tomorrow = addDays(new Date(today), 1).getTime();
+  const dayAfter = addDays(new Date(today), 2).getTime();
+  const clip = (from, to) => bands
+    .filter(b => b.from < to && b.to > from)
+    .map(b => ({ from: Math.max(b.from, from), to: Math.min(b.to, to), p: b.p, len: b.to - b.from }));
+  const t = clip(today, tomorrow);
+  if (!t.length) return { kind: 'unknown', html: '<span class="muted">No rate published for today</span>' };
+
+  if (t.length >= 24) {
+    const ps = t.map(b => b.p);
+    const avg = ps.reduce((x, y) => x + y, 0) / ps.length;
+    const tm = clip(tomorrow, dayAfter);
+    const tmNote = tm.length >= 24 ? ` · tomorrow ${pence(Math.min(...tm.map(b => b.p)))}–${pence(Math.max(...tm.map(b => b.p)))}` : '';
+    return {
+      kind: 'half-hourly',
+      html: `<b>${pence(rateAt(bands, now))}</b> now<br><span class="muted">Today ${pence(Math.min(...ps))}–${pence(Math.max(...ps))}, avg ${pence(avg)}${tmNote}</span>`,
+    };
+  }
+
+  // Daily-changing (Tracker): bands about a day long that end. Bands start at midnight UTC,
+  // so read each day at midday to avoid the 23:00/01:00 overlap in summer time.
+  if (t.every(b => b.len >= 23 * 3600e3 && b.len <= 25 * 3600e3)) {
+    const noon = d => new Date(d + 12 * 3600e3).getTime();
+    const tp = rateAt(bands, noon(today));
+    const tmp = rateAt(bands, noon(tomorrow));
+    return {
+      kind: 'daily',
+      html: `<b>${pence(tp)}</b>/kWh today<br><span class="muted">${tmp != null ? `Tomorrow ${pence(tmp)}` : "Tomorrow's rate isn't published yet"}</span>`,
+    };
+  }
+
+  const prices = [...new Set(t.map(b => b.p))];
+  if (prices.length === 1) return { kind: 'flat', html: `<b>${pence(prices[0])}</b>/kWh` };
+
+  // Time-of-use: list each price with its windows, joining a window that wraps past midnight.
+  const lines = prices.sort((x, y) => x - y).map(p => {
+    const wins = [];
+    for (const b of t.filter(x => x.p === p)) {
+      const last = wins[wins.length - 1];
+      if (last && last.to === b.from) last.to = b.to; else wins.push({ from: b.from, to: b.to });
+    }
+    if (wins.length > 1 && wins[0].from === today && wins[wins.length - 1].to === tomorrow) {
+      const first = wins.shift();
+      wins[wins.length - 1].to = first.to;
+    }
+    const isNow = rateAt(bands, now) === p;
+    return `<b>${pence(p)}</b> ${wins.map(w => `${hhmm(w.from)}–${hhmm(w.to)}`).join(', ')}${isNow ? ' <span class="now-tag">now</span>' : ''}`;
+  });
+  return { kind: 'time-of-use', html: lines.join('<br>') };
+}
+
+const KIND_NOTE = {
+  'half-hourly': 'Changes every half hour',
+  daily: 'Changes daily',
+  'time-of-use': 'Cheaper at set times',
+  flat: '',
+  unknown: '',
+};
+
+async function renderCurrentRates() {
+  const box = document.getElementById('current-rates');
+  if (!box) return;
+  const c = settings.connected || {};
+  const rows = [
+    settings.elecTariff && { label: 'Electricity', name: c.elecTariff, code: settings.elecTariff },
+    settings.gasTariff && settings.gas && { label: 'Gas', name: c.gasTariff, code: settings.gasTariff },
+    settings.exportTariff && settings.exportEnabled && { label: 'Export', name: c.exportTariff, code: settings.exportTariff, isExport: true },
+  ].filter(Boolean);
+
+  if (!rows.length) {
+    box.innerHTML = settings.connected
+      ? '<p class="small muted" style="margin:0">Press “Refresh from account” to show your current rates.</p>'
+      : '';
+    return;
+  }
+  box.innerHTML = `<h3>Your current rates</h3>${rows.map((r, i) => `
+    <div class="rate-card" id="rate-${i}">
+      <div class="rate-head"><b>${esc(r.label)}</b><span class="muted">${esc(r.name || productFromCode(r.code))}</span></div>
+      <div class="rate-body muted small">Loading…</div>
+    </div>`).join('')}
+    <p class="small muted" style="margin:6px 0 0">Prices include VAT.</p>`;
+
+  await Promise.all(rows.map(async (r, i) => {
+    const el = document.querySelector(`#rate-${i} .rate-body`);
+    try {
+      const rates = await loadTariffRates(r.code);
+      if (!el.isConnected) return;
+      let unitHtml, note = '';
+      if (rates.twoRate) {
+        const day = describeUnitRates(rates.unit);
+        const night = describeUnitRates(rates.night);
+        unitHtml = `Day ${day.html} · Night ${night.html}`;
+        note = 'Economy 7 — night hours depend on your meter';
+      } else {
+        const d = describeUnitRates(rates.unit);
+        unitHtml = d.html;
+        note = KIND_NOTE[d.kind];
+      }
+      el.classList.remove('muted', 'small');
+      el.innerHTML = `
+        <div class="kv"><span>${r.isExport ? 'You earn' : 'Unit rate'}</span><div>${unitHtml}${note ? `<div class="small muted">${note}</div>` : ''}</div></div>
+        ${r.isExport ? '' : `<div class="kv"><span>Standing</span><div><b>${pence(rates.standing)}</b>/day</div></div>`}`;
+    } catch (e) {
+      if (el.isConnected) el.textContent = `Couldn't load rates (${e.message})`;
+    }
+  }));
+}
+
+
 function connectedSummary() {
   const c = settings.connected;
   if (!c) return '';
@@ -931,6 +1073,7 @@ function renderSettings() {
         <span id="connect-status" class="small muted" role="status"></span>
       </div>
       <div id="connected">${connectedSummary()}</div>
+      <div id="current-rates" class="rates"></div>
       <p class="small muted" style="margin:10px 0 0">Stored only in this browser and sent only to api.octopus.energy.</p>
     </section>
 
@@ -1008,6 +1151,7 @@ function renderSettings() {
     f.querySelectorAll('input,select').forEach(i => { i.disabled = !on; });
   }) || form.querySelectorAll('[data-dep-off]').forEach(p => { p.hidden = !!settings[p.dataset.depOff]; });
   syncDeps();
+  renderCurrentRates();
 
   form.querySelectorAll('details.group').forEach(d => d.addEventListener('toggle', () => {
     const open = [...form.querySelectorAll('details.group[open]')].map(x => x.dataset.group);
