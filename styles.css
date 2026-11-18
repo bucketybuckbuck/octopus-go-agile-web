@@ -210,3 +210,5 @@ details.group[open] > summary::after { transform: rotate(90deg); }
 .switch-tag { display: inline-block; font-size: 12px; font-weight: 600; color: var(--primary); border: 1px solid var(--primary); border-radius: 999px; padding: 1px 10px; margin-bottom: 6px; }
 .cheaper { color: var(--teal); font-weight: 600; }
 .dearer { color: #d33; font-weight: 600; }
+.tariff-note { margin: -2px 0 6px; }
+.tariff-note b { color: var(--text); font-weight: 600; }

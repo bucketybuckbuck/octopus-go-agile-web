@@ -382,6 +382,8 @@ function computeDay(slots, tb, opts) {
     mineName: tb.actualName || null,
     mineKind: tb.actualKind || null,
     mineCode: tb.actual ? tb.actual.code : null,
+    agileCode: tb.agile ? tb.agile.code : null,
+    goCode: tb.go ? tb.go.code : null,
     mineApprox: !!(tb.actual && tb.actual.twoRate),
     agileAvg: agileRateN ? agileRateSum / agileRateN : null,
     actualAvg: total ? (tb.actual ? energyMine : energyAgile) / total : null,
@@ -823,7 +825,7 @@ function signedDiff(alt, paid, isExport) {
   return `<span class="${better > 0 ? 'cheaper' : 'dearer'}">${pounds(Math.abs(better))} ${isExport ? (better > 0 ? 'more' : 'less') : (better > 0 ? 'cheaper' : 'dearer')}</span>`;
 }
 
-function dayCardInner(day, date, isExport, switched) {
+function dayCardInner(day, date, isExport, switched, current) {
   const a = isExport ? 'Agile Outgoing' : 'Agile';
   const g = isExport ? 'Fixed' : 'Go';
   const col = mineColumn(day, isExport);
@@ -835,9 +837,21 @@ function dayCardInner(day, date, isExport, switched) {
   if (settings.showAverage && day.total > 0) {
     avg = `<div class="small muted">Agile avg rate ${pence(day.agileAvg)} · your avg ${pence(day.actualAvg)} · ${g} avg ${pence(day.goAvg)}</div>`;
   }
+  // Only mention tariff versions when they differ from today's, so ordinary days stay uncluttered.
+  const notes = [];
+  if (current && day.mineCode && day.mineCode !== current.mine) {
+    notes.push(`Your tariff then: <b>${esc(day.mineName || productFromCode(day.mineCode))}</b> (${esc(productFromCode(day.mineCode))})`);
+  }
+  if (current) {
+    const cmp = [];
+    if (day.agileCode && day.agileCode !== day.mineCode && productFromCode(day.agileCode) !== current.agile) cmp.push(`${a} ${esc(productFromCode(day.agileCode))}`);
+    if (day.goCode && day.goCode !== day.mineCode && productFromCode(day.goCode) !== current.go) cmp.push(`Go ${esc(productFromCode(day.goCode))}`);
+    if (cmp.length) notes.push(`Compared with ${cmp.join(', ')} — the version${cmp.length > 1 ? 's' : ''} on sale then`);
+  }
+  const versionNote = notes.length ? `<div class="small muted tariff-note">${notes.join('<br>')}</div>` : '';
   return `${switched ? `<div class="switch-tag">Switched to ${esc(switched)}</div>` : ''}<div class="day-head">
       <span class="totals">${mine}<b class="agile">${a} ${pounds(day.agileCost)}</b>${tag('agile')} · <b class="go">${g} ${pounds(day.goCost)}</b>${tag('go')} · ${kwh(day.total)}</span>
-    </div>${avg}`;
+    </div>${versionNote}${avg}`;
 }
 
 /** Warning highlight: flag days where Agile or Go would have beaten the tariff you were on. */
@@ -883,6 +897,14 @@ async function renderHistory(token) {
 
   const byDay = splitByDay(data.slots, days);
   const shiftAll = settings.timeshift && settings.timeshiftAll;
+  const todayArr = [midnight(new Date())];
+  const [agileNow, goNow] = isExport ? [[], []] : await Promise.all([versionsFor('agile', todayArr), versionsFor('go', todayArr)]);
+  if (token !== renderToken) return;
+  const current = {
+    mine: (isExport ? settings.exportTariff : settings.elecTariff) || null,
+    agile: isExport ? settings.exportProduct : (versionAt(agileNow, Date.now()) || settings.agileProduct),
+    go: isExport ? null : (versionAt(goNow, Date.now()) || settings.goProduct),
+  };
   const results = [];
   let prevCode = null;
   for (const d of days) {
@@ -919,7 +941,7 @@ async function renderHistory(token) {
   const draw = card => {
     const r = withData[+card.dataset.i];
     const day = r.showShift && r.shifted ? r.shifted : r.day;
-    card.querySelector('.day-body').innerHTML = dayCardInner(day, r.date, isExport, r.switched);
+    card.querySelector('.day-body').innerHTML = dayCardInner(day, r.date, isExport, r.switched, current);
     paintWarn(card, day, isExport);
     if (drawn.has(card)) { const old = drawn.get(card); charts.delete(old); old.destroy(); }
     drawn.set(card, dayChart(card.querySelector('canvas'), day, { isExport }));
