@@ -703,6 +703,7 @@ async function renderHome(token) {
     return;
   }
   el.innerHTML = `
+    <div id="install-slot"></div>
     <section class="card" id="yesterday-card">
       <h2 id="yesterday-title">Yesterday</h2>
       <div id="yesterday-body" class="muted small">Loading…</div>
@@ -1598,6 +1599,10 @@ function renderAbout() {
       into the cheap Go window, leaving the baseload behind. Tap a day's graph to switch between actual and shifted.</p>
     <p><b>Daily average unit rates</b> compare Agile's plain average price for the day with the average you actually paid — if yours is lower,
       you're using more power in cheaper half-hours.</p>
+    <h3>Install on your phone</h3>
+    <p>${installPrompt ? '<button type="button" class="btn" id="about-install">Install app</button>' : isStandalone()
+      ? 'You’re using the installed app.'
+      : 'In Chrome on Android, tap <b>⋮</b> then <b>Install app</b> (or <b>Add to home screen</b>). It then opens in its own window, without the browser bars, and works offline with your last-loaded data.'}</p>
     <h3>Privacy</h3>
     <p>Your API key and meter details are stored only in this browser (localStorage) and sent only to
       <code>api.octopus.energy</code>. Readings are cached locally to keep things fast; clear them from Settings.</p>
@@ -1627,3 +1632,48 @@ document.getElementById('export-switch').onchange = e => { exportMode = e.target
 window.addEventListener('hashchange', route);
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (settings.theme === 'system') route(); });
 route();
+
+/* ---------------- installable app ---------------- */
+var installPrompt = null; // var: About may render (via route()) before this line runs
+function isStandalone() {
+  return window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+}
+async function runInstall() {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  const { outcome } = await installPrompt.userChoice;
+  installPrompt = null;
+  showInstallCard();
+  if (outcome === 'accepted') toast('Installing — look for Go Agile on your home screen.');
+}
+/** A small, dismissible "Install" card on Home, only when Chrome says the app can be installed. */
+function showInstallCard() {
+  const slot = document.getElementById('install-slot');
+  if (!slot) return;
+  if (!installPrompt || isStandalone() || store.get('ga:installDismissed', false)) { slot.innerHTML = ''; return; }
+  slot.innerHTML = `<section class="card install-card">
+    <div><b>Install Go Agile</b><div class="small muted">Open it from your home screen like an app.</div></div>
+    <div class="row"><button type="button" class="btn" id="install-btn">Install</button>
+    <button type="button" class="icon-btn dismiss" id="install-dismiss" aria-label="Not now">×</button></div></section>`;
+  document.getElementById('install-btn').onclick = runInstall;
+  document.getElementById('install-dismiss').onclick = () => { store.set('ga:installDismissed', true); slot.innerHTML = ''; };
+}
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault(); // show our own button instead of Chrome's mini-bar
+  installPrompt = e;
+  showInstallCard();
+  const btn = document.getElementById('about-install');
+  if (btn) btn.onclick = runInstall;
+});
+window.addEventListener('appinstalled', () => { installPrompt = null; showInstallCard(); });
+// Re-attach after each page render (Home and About are rebuilt on navigation).
+window.addEventListener('hashchange', () => setTimeout(() => {
+  showInstallCard();
+  const btn = document.getElementById('about-install');
+  if (btn) btn.onclick = runInstall;
+}, 0));
+showInstallCard();
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}

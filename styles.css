@@ -212,3 +212,5 @@ details.group[open] > summary::after { transform: rotate(90deg); }
 .pricier { color: #d33; font-weight: 600; }
 .tariff-note { margin: -2px 0 6px; }
 .tariff-note b { color: var(--text); font-weight: 600; }
+.install-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; border-color: var(--primary); }
+.install-card .icon-btn.dismiss { background: transparent; color: var(--muted); font-size: 24px; }
