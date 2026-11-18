@@ -24,7 +24,17 @@ Live at https://bucketybuckbuck.github.io/octopus-go-agile-web/ (GitHub Pages, s
 | Settings | `#settings` (saves automatically) |
 | About | `#about` |
 
+## Setup
+
+Enter your Octopus **API key** and **account number** in Settings and press **Connect**. The app reads
+your account from the Octopus API and fills in everything else: import and export MPANs, meter serials
+(it uses the meter that actually has readings), region, current tariffs, the fixed export rate, and your gas
+meter and gas tariff. You can still enter the details by hand under "Meter details".
+
 ## Differences from the Android version
+
+- **Set up from your account number** instead of typing in MPAN, serial and region.
+- **Gas costs use your real gas tariff** (unit rate and standing charge) once connected.
 
 - **Go rates come from the API.** The Android app hard-coded the Go and Go Faster windows and
   used old product codes (`AGILE-18-02-21`, `GO-18-06-12`, both retired). The web version reads Go's

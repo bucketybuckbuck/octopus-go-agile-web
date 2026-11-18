@@ -20,7 +20,7 @@ const ALL_HOURS = Array.from({ length: 48 }, (_, i) =>
   `${String(Math.floor(i / 2)).padStart(2, '0')}:${i % 2 ? '30' : '00'}`);
 
 const DEFAULTS = {
-  apiKey: '', mpan: '', serial: '', region: '',
+  apiKey: '', accountNumber: '', connected: null, mpan: '', serial: '', region: '', gasTariff: '',
   exportEnabled: false, exportMpan: '', exportSerial: '', exportFixed: 15,
   agileProduct: 'AGILE-24-10-01', goProduct: 'GO-VAR-22-10-14', exportProduct: 'AGILE-OUTGOING-19-05-13',
   smartTariff: false, currentTariff: 'go', highlightBorder: false, showAverage: false, startDay: 1,
@@ -118,6 +118,115 @@ function consumptionUrl(kind, mpan, serial, from, to) {
   const base = kind === 'gas' ? 'gas-meter-points' : 'electricity-meter-points';
   return `${API}/${base}/${encodeURIComponent(mpan)}/meters/${encodeURIComponent(serial)}/consumption/` +
     `?period_from=${iso(from)}&period_to=${iso(to)}&page_size=25000&order_by=period`;
+}
+
+/** "E-1R-AGILE-24-10-01-C" → "AGILE-24-10-01"; "G-1R-VAR-22-11-01-C" → "VAR-22-11-01". */
+function productFromCode(code) { return String(code || '').replace(/^[EG]-\d+R-/, '').replace(/-[A-P]$/, ''); }
+function regionFromCode(code) { const m = /-([A-P])$/.exec(code || ''); return m ? m[1] : ''; }
+function gasTariffUrl(kind, from, to) {
+  const code = settings.gasTariff;
+  const range = from ? `?period_from=${iso(from)}&period_to=${iso(to)}&page_size=1500` : '';
+  return `${API}/products/${productFromCode(code)}/gas-tariffs/${code}/${kind}/${range}`;
+}
+function tariffKind(product) {
+  if (/^AGILE-OUTGOING/.test(product)) return 'agile-export';
+  if (/^AGILE-/.test(product)) return 'agile';
+  if (/^(GO|INTELLI|IOG)/.test(product)) return 'go';
+  return 'other';
+}
+
+/**
+ * Look up the account and fill in meters, serials, region and tariffs.
+ * Needs only the API key and account number (A-XXXXXXXX).
+ */
+async function connectAccount() {
+  const acct = settings.accountNumber.trim().toUpperCase();
+  if (!settings.apiKey || !acct) throw new Error('Enter your API key and account number first.');
+  const j = await fetchJson(`${API}/accounts/${encodeURIComponent(acct)}/`, true).catch(e => {
+    if (e.status === 404) throw new Error(`Account ${acct} wasn't found. Check the number (it looks like A-1B2C3D4E).`);
+    throw e;
+  });
+  const now = Date.now();
+  const props = j.properties || [];
+  const prop = props.find(p => !p.moved_out_at || Date.parse(p.moved_out_at) > now) || props[props.length - 1];
+  if (!prop) throw new Error('No properties found on this account.');
+
+  const currentAgreement = ags => {
+    const list = (ags || []).slice().sort((a, b) => Date.parse(b.valid_from) - Date.parse(a.valid_from));
+    return list.find(a => Date.parse(a.valid_from) <= now && (!a.valid_to || Date.parse(a.valid_to) > now)) || list[0];
+  };
+  // A meter point can list old meters too; use the newest one that actually has readings.
+  const pickSerial = async (kind, id, meters) => {
+    const serials = (meters || []).map(m => m.serial_number).filter(Boolean).reverse();
+    const base = kind === 'gas' ? 'gas-meter-points' : 'electricity-meter-points';
+    for (const s of serials) {
+      try {
+        const r = await fetchJson(`${API}/${base}/${encodeURIComponent(id)}/meters/${encodeURIComponent(s)}/consumption/?page_size=1`, true);
+        if (r.count > 0) return s;
+      } catch { /* try the next meter */ }
+    }
+    return serials[0] || '';
+  };
+
+  const productName = async p => (await fetchJson(`${API}/products/${p}/`, false).catch(() => ({}))).display_name || p;
+  const summary = { account: acct, address: [prop.address_line_1, prop.postcode].filter(Boolean).join(', ') };
+  const elec = prop.electricity_meter_points || [];
+  const imp = elec.find(p => !p.is_export);
+  const exp = elec.find(p => p.is_export);
+
+  if (imp) {
+    settings.mpan = imp.mpan;
+    settings.serial = await pickSerial('elec', imp.mpan, imp.meters);
+    const ag = currentAgreement(imp.agreements);
+    if (ag) {
+      const product = productFromCode(ag.tariff_code);
+      settings.region = regionFromCode(ag.tariff_code) || settings.region;
+      const kind = tariffKind(product);
+      if (kind === 'agile') { settings.agileProduct = product; settings.currentTariff = 'agile'; }
+      if (kind === 'go') { settings.goProduct = product; settings.currentTariff = 'go'; }
+      summary.elecTariff = await productName(product);
+    }
+    if (!settings.region) {
+      const mp = await fetchJson(`${API}/electricity-meter-points/${encodeURIComponent(imp.mpan)}/`, false).catch(() => ({}));
+      settings.region = (mp.gsp || '').replace('_', '');
+    }
+  }
+  if (exp) {
+    settings.exportEnabled = true;
+    settings.exportMpan = exp.mpan;
+    settings.exportSerial = await pickSerial('elec', exp.mpan, exp.meters);
+    const ag = currentAgreement(exp.agreements);
+    if (ag) {
+      const product = productFromCode(ag.tariff_code);
+      summary.exportTariff = await productName(product);
+      if (tariffKind(product) === 'agile-export') settings.exportProduct = product;
+      else {
+        const r = await fetchJson(`${API}/products/${product}/electricity-tariffs/${ag.tariff_code}/standard-unit-rates/?page_size=1`, false).catch(() => null);
+        if (r && r.results && r.results[0]) settings.exportFixed = r.results[0].value_inc_vat;
+      }
+    }
+  } else {
+    settings.exportEnabled = false;
+  }
+  const gas = (prop.gas_meter_points || [])[0];
+  if (gas) {
+    settings.gas = true;
+    settings.mprn = gas.mprn;
+    settings.gasSerial = await pickSerial('gas', gas.mprn, gas.meters);
+    const ag = currentAgreement(gas.agreements);
+    settings.gasTariff = ag ? ag.tariff_code : '';
+    if (ag) summary.gasTariff = await productName(productFromCode(ag.tariff_code));
+  } else {
+    settings.gas = false;
+  }
+  summary.mpan = settings.mpan; summary.region = settings.region;
+  summary.exportMpan = exp ? settings.exportMpan : ''; summary.mprn = gas ? settings.mprn : '';
+  settings.accountNumber = acct;
+  settings.connected = summary;
+  store.clearCache();
+  historyOffset = 0;
+  saveSettings();
+  return summary;
 }
 
 /** Normalise rate results into sorted bands {from, to, p}. */
@@ -381,9 +490,8 @@ function setPeriodNav(show, label, canNext, showExport) {
 function needsSetup(what) {
   return `<div class="notice">
     <h2>Set up your account</h2>
-    <p>${what} needs your Octopus API key, electricity MPAN, meter serial and region.
-    You can find these in your Octopus account under
-    <a href="https://octopus.energy/dashboard/developer/" target="_blank" rel="noopener">Personal API key</a>.</p>
+    <p>${what} needs your Octopus API key and account number — the app looks up the rest.
+    Both are on your <a href="https://octopus.energy/dashboard/new/accounts/personal-details/api-access" target="_blank" rel="noopener">Octopus API access page</a>.</p>
     <p><a href="#settings" class="btn" style="text-decoration:none;display:inline-block">Open settings</a></p>
   </div>`;
 }
@@ -445,7 +553,7 @@ async function renderHome(token) {
   // Yesterday's usage chart (shown at the top of the Android home screen)
   const body = document.getElementById('yesterday-body');
   if (!isConfigured()) {
-    body.innerHTML = 'Add your API key, MPAN and meter serial in <a href="#settings">Settings</a> to see yesterday\'s Agile vs Go comparison here.';
+    body.innerHTML = 'Connect your Octopus account in <a href="#settings">Settings</a> to see yesterday\'s Agile vs Go comparison here.';
     return;
   }
   const yStart = addDays(today, -1);
@@ -685,30 +793,47 @@ async function renderGas(token) {
   const period = billingPeriod(historyOffset);
   setPeriodNav(true, periodLabel(period), historyOffset < 0, false);
   if (!isGasConfigured()) {
-    el.innerHTML = `<div class="notice"><h2>Gas</h2><p>Turn on gas in <a href="#settings">Settings</a> and add your
-      API key, MPRN and gas meter serial to see gas usage and cost.</p></div>`;
+    el.innerHTML = `<div class="notice"><h2>Gas</h2><p>${settings.connected
+      ? 'No gas meter was found on your Octopus account.'
+      : 'Connect your Octopus account in <a href="#settings">Settings</a> — if you have a gas smart meter it\'s picked up automatically.'}</p></div>`;
     return;
   }
   el.innerHTML = `<section class="card" id="gas-summary"><h2>Gas summary</h2><div class="muted small">Loading…</div></section><div id="gas-days"></div>`;
   const days = daysIn(period.start, period.end).filter(d => d <= new Date());
   const to = Math.min(period.end.getTime(), midnight(addDays(new Date(), 1)).getTime());
-  let cons;
+  let cons, unitBands = [], scBands = [];
   try {
-    cons = await cachedAll('gas', consumptionUrl('gas', settings.mprn, settings.gasSerial, period.start.getTime(), to), true, to);
+    const gasRates = settings.gasTariff ? Promise.all([
+      cachedAll('rates', gasTariffUrl('standard-unit-rates', period.start.getTime(), to), false, to),
+      cachedAll('sc', gasTariffUrl('standing-charges'), false),
+    ]).catch(() => [[], []]) : Promise.resolve([[], []]);
+    [cons, [unitBands, scBands]] = await Promise.all([
+      cachedAll('gas', consumptionUrl('gas', settings.mprn, settings.gasSerial, period.start.getTime(), to), true, to),
+      gasRates.then(([u, s]) => [toBands(u), toBands(s)]),
+    ]);
   } catch (e) {
     if (token !== renderToken) return;
     el.innerHTML = errorBox(e);
     return;
   }
   if (token !== renderToken) return;
-  const slots = cons.map(c => ({ t: Date.parse(c.interval_start), kwh: gasKwh(c.consumption) })).sort((a, b) => a.t - b.t);
+  const useTariff = unitBands.length > 0;
+  const manualUnit = num(settings.gasUnitRate, 6), manualSc = num(settings.gasStanding, 30);
+  const unitAt = t => (useTariff ? rateAt(unitBands, t) ?? manualUnit : manualUnit);
+  const scAt = t => (useTariff ? rateAt(scBands, t) ?? manualSc : manualSc);
+  const slots = cons.map(c => {
+    const t = Date.parse(c.interval_start);
+    return { t, kwh: gasKwh(c.consumption), p: unitAt(t) };
+  }).sort((a, b) => a.t - b.t);
   const byDay = splitByDay(slots, days);
-  const unit = num(settings.gasUnitRate, 6), sc = num(settings.gasStanding, 30);
   const results = days.map(d => {
     const s = byDay.get(d.getTime()) || [];
     const total = s.reduce((a, x) => a + x.kwh, 0);
-    return { date: d, slots: s, total, cost: s.length ? total * unit + sc : 0 };
+    const energy = s.reduce((a, x) => a + x.kwh * x.p, 0);
+    return { date: d, slots: s, total, cost: s.length ? energy + scAt(d.getTime()) : 0 };
   }).filter(r => r.slots.length);
+  const lastDay = results.length ? results[results.length - 1].date.getTime() : Date.now();
+  const unit = unitAt(lastDay), sc = scAt(lastDay);
 
   const sumEl = document.getElementById('gas-summary');
   if (!results.length) { sumEl.innerHTML = '<h2>Gas summary</h2><p class="muted">No gas readings in this period yet.</p>'; return; }
@@ -720,7 +845,7 @@ async function renderGas(token) {
       <div class="stat"><div class="label">Used</div><div class="value">${total.toFixed(1)} kWh</div></div>
       <div class="stat"><div class="label">Daily average</div><div class="value">${pounds(cost / results.length)}</div></div>
     </div>
-    <p class="small muted" style="margin:8px 0 0">At ${pence(unit)}/kWh and ${pence(sc)}/day standing charge${settings.gasKwh ? '' : `; m³ converted with volume correction ${settings.volumeCorrection} and calorific value ${settings.calorificValue}`}.</p>`;
+    <p class="small muted" style="margin:8px 0 0">${useTariff ? `Your tariff (${esc(productFromCode(settings.gasTariff))}): currently` : 'At'} ${pence(unit)}/kWh and ${pence(sc)}/day standing charge${settings.gasKwh ? '' : `; m³ converted with volume correction ${settings.volumeCorrection} and calorific value ${settings.calorificValue}`}.</p>`;
 
   const gasEl = document.getElementById('gas-days');
   const list = results.slice().reverse();
@@ -735,7 +860,7 @@ async function renderGas(token) {
     const o = baseChartOptions();
     o.plugins.legend.display = false;
     o.scales.y.title = { display: true, text: 'kWh', color: css('--muted') };
-    o.plugins.tooltip = { callbacks: { label: c => ` ${c.parsed.y.toFixed(3)} kWh · ${pence(c.parsed.y * unit)}` } };
+    o.plugins.tooltip = { callbacks: { label: c => ` ${c.parsed.y.toFixed(3)} kWh · ${pence(c.parsed.y * r.slots[c.dataIndex].p)}` } };
     charts.add(new Chart(e.target.querySelector('canvas'), {
       type: 'bar',
       data: { labels: r.slots.map(s => hhmm(s.t)),
@@ -761,79 +886,119 @@ function field(key, label, type = 'text', extra = {}) {
     input = `<input type="${type}" name="${key}" value="${esc(v ?? '')}" ${type === 'number' ? 'step="any"' : ''}
       ${extra.placeholder ? `placeholder="${esc(extra.placeholder)}"` : ''} autocomplete="off" spellcheck="false">`;
   }
-  return `<label class="field"${dep}><span>${label}${hint}</span>${input}${extra.after || ''}</label>`;
+  return `<label class="field"${dep}><span>${label}${hint}</span>${input}</label>`;
+}
+
+function section(id, title, summary, body, open) {
+  return `<details class="group" data-group="${id}" ${open ? 'open' : ''}>
+    <summary><span class="g-title">${title}</span><span class="g-sub">${summary}</span></summary>
+    <div class="g-body">${body}</div></details>`;
+}
+
+function regionName(code) { const r = REGIONS.find(([c]) => c === code); return r ? `${r[1]} (${code})` : '—'; }
+
+function connectedSummary() {
+  const c = settings.connected;
+  if (!c) return '';
+  const row = (k, v) => (v ? `<div class="kv"><span>${k}</span><b>${esc(v)}</b></div>` : '');
+  return `<div class="connected">
+    <div class="ok">✓ Connected to ${esc(c.account)}${c.address ? ` · ${esc(c.address)}` : ''}</div>
+    ${row('Electricity', `${c.mpan}${c.elecTariff ? ' · ' + c.elecTariff : ''}`)}
+    ${row('Region', regionName(c.region))}
+    ${row('Export', c.exportMpan ? `${c.exportMpan}${c.exportTariff ? ' · ' + c.exportTariff : ''}` : '')}
+    ${row('Gas', c.mprn ? `${c.mprn}${c.gasTariff ? ' · ' + c.gasTariff : ''}` : '')}
+  </div>`;
 }
 
 function renderSettings() {
   setPeriodNav(false);
   const hours = new Set(settings.timeshiftHours || ALL_HOURS);
+  const openGroups = new Set(store.get('ga:openGroups', []));
+  const ready = isConfigured();
+  const status = ready
+    ? `MPAN ${esc(settings.mpan)} · ${esc(regionName(settings.region))}`
+    : 'Not set up yet';
+
   view().innerHTML = `<form class="settings" id="settings-form" autocomplete="off">
-    <fieldset><legend>Octopus details</legend>
-      ${field('apiKey', 'API key', 'password', { hint: 'From <a href="https://octopus.energy/dashboard/developer/" target="_blank" rel="noopener">your Octopus developer page</a>. Stored only in this browser.', placeholder: 'sk_live_…' })}
+    <section class="card setup">
+      <h2>Your Octopus account</h2>
+      <p class="small muted" style="margin:0 0 10px">Just two things — everything else (meters, region, tariffs, export and gas) is looked up for you.
+        Both are on your <a href="https://octopus.energy/dashboard/new/accounts/personal-details/api-access" target="_blank" rel="noopener">Octopus API access page</a>.</p>
+      ${field('apiKey', 'API key', 'password', { placeholder: 'sk_live_…' })}
+      ${field('accountNumber', 'Account number', 'text', { placeholder: 'A-1B2C3D4E' })}
+      <div class="row" style="padding:6px 0 0">
+        <button type="button" class="btn" id="connect">${settings.connected ? 'Refresh from account' : 'Connect'}</button>
+        <span id="connect-status" class="small muted" role="status"></span>
+      </div>
+      <div id="connected">${connectedSummary()}</div>
+      <p class="small muted" style="margin:10px 0 0">Stored only in this browser and sent only to api.octopus.energy.</p>
+    </section>
+
+    ${section('manual', 'Meter details', esc(status), `
+      <p class="small muted" style="margin:0 0 6px">Filled in automatically when you connect. Edit only if something's wrong.</p>
       ${field('mpan', 'Import MPAN', 'text', { placeholder: '13-digit number' })}
       ${field('serial', 'Meter serial')}
-      ${field('region', 'Region', 'select', { options: [['', 'Select…'], ...REGIONS.map(([c, n]) => [c, `${n} (${c})`])],
-        after: '' })}
+      ${field('region', 'Region', 'select', { options: [['', 'Select…'], ...REGIONS.map(([c, n]) => [c, `${n} (${c})`])] })}
       <div class="row" style="padding:4px 0 8px"><button type="button" class="btn secondary" id="detect-region">Detect region from MPAN</button></div>
-      ${field('exportEnabled', 'Export tariff', 'checkbox', { hint: 'Adds an Export switch to History' })}
+      ${field('exportEnabled', 'Export meter', 'checkbox', { hint: 'Adds an Export switch to History' })}
       ${field('exportMpan', 'Export MPAN', 'text', { dep: 'exportEnabled' })}
-      ${field('exportSerial', 'Export meter serial', 'text', { dep: 'exportEnabled', hint: 'Leave blank to use the import serial' })}
-      ${field('exportFixed', 'Export fixed price (p/kWh)', 'number', { dep: 'exportEnabled', hint: 'Compared against Agile Outgoing' })}
-    </fieldset>
+      ${field('exportSerial', 'Export meter serial', 'text', { dep: 'exportEnabled', hint: 'Blank = same as import' })}
+      ${field('gas', 'Gas meter', 'checkbox')}
+      ${field('mprn', 'MPRN', 'text', { dep: 'gas' })}
+      ${field('gasSerial', 'Gas meter serial', 'text', { dep: 'gas' })}
+    `, openGroups.has('manual'))}
 
-    <fieldset><legend>Tariff products</legend>
-      <p class="small muted" style="margin:0 0 6px">Product codes used for the comparison. Go rates are read from the API, so any time-of-use window (Go, Intelligent Go…) works.</p>
+    ${section('compare', 'Comparison', `Billing starts day ${esc(settings.startDay)}${settings.smartTariff ? ' · warnings on' : ''}`, `
+      ${field('startDay', 'Billing start day', 'number', { hint: 'Day of the month your bill starts (1–28)' })}
+      ${field('smartTariff', 'Warn on dearer days', 'checkbox', { hint: 'Highlight days where the other tariff would have been cheaper' })}
+      ${field('currentTariff', "Tariff you're on", 'select', { dep: 'smartTariff', options: [['go', 'Go'], ['agile', 'Agile']] })}
+      ${field('highlightBorder', 'Highlight with border', 'checkbox', { dep: 'smartTariff', hint: 'Off = shaded background' })}
+      ${field('showAverage', 'Show average unit rates', 'checkbox', { hint: "Agile's average price vs the average you actually paid" })}
+      ${field('exportFixed', 'Fixed export price (p/kWh)', 'number', { dep: 'exportEnabled', hint: 'Compared against Agile Outgoing' })}
+    `, openGroups.has('compare'))}
+
+    ${section('home', 'Price list', [settings.showPriceNow && 'from now', settings.showDayAverage && 'avg/min/max', settings.highlightPrices && 'shaded'].filter(Boolean).join(' · ') || 'all prices', `
+      ${field('showPriceNow', 'Only current & future prices', 'checkbox')}
+      ${field('showDayAverage', 'Show avg / min / max', 'checkbox')}
+      ${field('avgDay', 'For', 'select', { dep: 'showDayAverage', options: [['today', 'Today'], ['tomorrow', 'Tomorrow']] })}
+      ${field('highlightPrices', 'Colour prices', 'checkbox', { hint: 'Green below the low threshold, red above the high one' })}
+      ${field('lowThreshold', 'Low threshold (p)', 'number', { dep: 'highlightPrices' })}
+      ${field('highThreshold', 'High threshold (p)', 'number', { dep: 'highlightPrices' })}
+    `, openGroups.has('home'))}
+
+    ${section('shift', 'Load shift', settings.timeshift ? 'on' : 'off', `
+      <p class="small muted" style="margin:0 0 6px">Estimates your Go cost if big loads (like a car or immersion heater) had run in the cheap window. Tap a day's graph to toggle.</p>
+      ${field('timeshift', 'Enable load shift', 'checkbox')}
+      ${field('loadThreshold', 'Shift half-hours above (kWh)', 'number', { dep: 'timeshift' })}
+      ${field('baseload', 'Baseload left behind (kWh)', 'number', { dep: 'timeshift' })}
+      ${field('timeshiftAll', 'Show shifted on all days', 'checkbox', { dep: 'timeshift' })}
+      <div class="field" data-dep="timeshift"><span>Hours that can be shifted<small><a href="#" id="hours-all">All</a> · <a href="#" id="hours-none">None</a></small></span>
+        <div class="hours-grid">${ALL_HOURS.map(h => `<label><input type="checkbox" name="hour" value="${h}" ${hours.has(h) ? 'checked' : ''}>${h}</label>`).join('')}</div></div>
+    `, openGroups.has('shift'))}
+
+    ${section('gasopts', 'Gas', settings.gas ? (settings.gasTariff ? 'rates from your tariff' : 'manual rates') : 'off', `
+      <p class="small muted" data-dep-off="gas" style="margin:0">No gas meter set up. Connect your account, or turn on "Gas meter" under Meter details.</p>
+      ${field('gasKwh', 'Meter reports kWh', 'checkbox', { dep: 'gas', hint: 'Usually on for SMETS1 meters, off for SMETS2 (m³). If gas use looks ~11× too low or high, flip this.' })}
+      ${settings.gasTariff ? `<p class="small muted">Unit rate and standing charge come from your tariff (${esc(productFromCode(settings.gasTariff))}). The values below are only used if that lookup fails.</p>` : ''}
+      ${field('gasUnitRate', 'Unit rate (p/kWh)', 'number', { dep: 'gas' })}
+      ${field('gasStanding', 'Standing charge (p/day)', 'number', { dep: 'gas' })}
+      ${field('volumeCorrection', 'Volume correction', 'number', { dep: 'gas' })}
+      ${field('calorificValue', 'Calorific value', 'number', { dep: 'gas' })}
+    `, openGroups.has('gasopts'))}
+
+    ${section('advanced', 'Advanced', esc(`${settings.agileProduct} vs ${settings.goProduct}`), `
+      <p class="small muted" style="margin:0 0 6px">The Octopus products being compared. Your own tariff is picked up when you connect.</p>
       ${field('agileProduct', 'Agile product')}
       ${field('goProduct', 'Go product')}
       ${field('exportProduct', 'Agile Outgoing product', 'text', { dep: 'exportEnabled' })}
       <div class="row" style="padding:4px 0"><button type="button" class="btn secondary" id="detect-products">Use latest Octopus products</button></div>
-    </fieldset>
-
-    <fieldset><legend>Graph options</legend>
-      ${field('smartTariff', 'Graph warning highlight', 'checkbox', { hint: 'Highlight days where the other tariff was cheaper' })}
-      ${field('currentTariff', 'Current tariff', 'select', { dep: 'smartTariff', options: [['go', 'Go (warn when Agile was cheaper)'], ['agile', 'Agile (warn when Go was cheaper)']] })}
-      ${field('highlightBorder', 'Highlight with border', 'checkbox', { dep: 'smartTariff', hint: 'Off = shaded background' })}
-      ${field('showAverage', 'Show daily average unit rates', 'checkbox', { hint: 'Agile average rate vs your actual average rate' })}
-      ${field('startDay', 'Billing start day', 'number', { hint: 'Day of the month your billing cycle starts (1–28)' })}
-    </fieldset>
-
-    <fieldset><legend>Home options</legend>
-      ${field('showPriceNow', 'Only current & future prices', 'checkbox')}
-      ${field('showDayAverage', 'Show avg / min / max', 'checkbox')}
-      ${field('avgDay', 'Avg / min / max day', 'select', { dep: 'showDayAverage', options: [['today', 'Today'], ['tomorrow', 'Tomorrow']] })}
-      ${field('highlightPrices', 'Shade timeslots', 'checkbox', { hint: 'Colour prices by threshold' })}
-      ${field('highThreshold', 'High price threshold (p)', 'number', { dep: 'highlightPrices' })}
-      ${field('lowThreshold', 'Low price threshold (p)', 'number', { dep: 'highlightPrices' })}
-    </fieldset>
-
-    <fieldset><legend>Load shift options</legend>
-      ${field('timeshift', 'Agile → Go load shift', 'checkbox', { hint: 'Estimate Go cost if big loads had been moved into the cheap window. Tap a graph to toggle.' })}
-      <div class="field" data-dep="timeshift"><span>Hours that could be shifted<small><a href="#" id="hours-all">All</a> · <a href="#" id="hours-none">None</a></small></span>
-        <div class="hours-grid">${ALL_HOURS.map(h => `<label><input type="checkbox" name="hour" value="${h}" ${hours.has(h) ? 'checked' : ''}>${h}</label>`).join('')}</div></div>
-      ${field('baseload', 'Baseload (kWh)', 'number', { dep: 'timeshift', hint: 'Left behind in each shifted half-hour' })}
-      ${field('loadThreshold', 'Load shift threshold (kWh)', 'number', { dep: 'timeshift', hint: 'Only half-hours above this are moved' })}
-      ${field('timeshiftAll', 'Show load shift on all days', 'checkbox', { dep: 'timeshift' })}
-    </fieldset>
-
-    <fieldset><legend>Gas options</legend>
-      ${field('gas', 'Gas', 'checkbox')}
-      ${field('mprn', 'MPRN', 'text', { dep: 'gas' })}
-      ${field('gasSerial', 'Gas meter serial', 'text', { dep: 'gas' })}
-      ${field('gasStanding', 'Standing charge (p/day)', 'number', { dep: 'gas' })}
-      ${field('gasUnitRate', 'Unit rate (p/kWh)', 'number', { dep: 'gas' })}
-      ${field('gasKwh', 'Meter reports kWh', 'checkbox', { dep: 'gas', hint: 'On for SMETS1 (kWh); off for SMETS2 (m³)' })}
-      ${field('volumeCorrection', 'Volume correction', 'number', { dep: 'gas' })}
-      ${field('calorificValue', 'Calorific value', 'number', { dep: 'gas' })}
-    </fieldset>
-
-    <fieldset><legend>App</legend>
       ${field('theme', 'Theme', 'select', { options: [['system', 'Match system'], ['light', 'Light'], ['dark', 'Dark']] })}
       <div class="row" style="padding:6px 0">
         <button type="button" class="btn secondary" id="clear-cache">Clear cached data</button>
-        <span class="small muted">Forces a refetch of all readings and prices. Settings are kept.</span>
+        <button type="button" class="btn secondary" id="forget">Forget my details</button>
       </div>
-    </fieldset>
-    <p class="small muted">Settings save automatically.</p>
+    `, openGroups.has('advanced'))}
+    <p class="small muted">Changes save automatically.</p>
   </form>`;
 
   const form = document.getElementById('settings-form');
@@ -841,8 +1006,13 @@ function renderSettings() {
     const on = !!settings[f.dataset.dep];
     f.classList.toggle('disabled', !on);
     f.querySelectorAll('input,select').forEach(i => { i.disabled = !on; });
-  });
+  }) || form.querySelectorAll('[data-dep-off]').forEach(p => { p.hidden = !!settings[p.dataset.depOff]; });
   syncDeps();
+
+  form.querySelectorAll('details.group').forEach(d => d.addEventListener('toggle', () => {
+    const open = [...form.querySelectorAll('details.group[open]')].map(x => x.dataset.group);
+    store.set('ga:openGroups', open);
+  }));
 
   form.addEventListener('input', e => {
     const t = e.target;
@@ -867,7 +1037,29 @@ function renderSettings() {
   document.getElementById('hours-all').onclick = e => { e.preventDefault(); setHours(true); };
   document.getElementById('hours-none').onclick = e => { e.preventDefault(); setHours(false); };
 
+  document.getElementById('connect').onclick = async () => {
+    const btn = document.getElementById('connect');
+    const st = document.getElementById('connect-status');
+    btn.disabled = true;
+    st.textContent = 'Looking up your account…';
+    try {
+      await connectAccount();
+      renderSettings();
+      document.getElementById('connect-status').textContent = 'Done — your meters and tariffs are set up.';
+    } catch (e) {
+      st.textContent = e.message;
+      btn.disabled = false;
+    }
+  };
+
   document.getElementById('clear-cache').onclick = () => { store.clearCache(); toast('Cached data cleared.'); };
+  document.getElementById('forget').onclick = () => {
+    settings = Object.assign({}, DEFAULTS, { theme: settings.theme });
+    store.clearCache();
+    saveSettings();
+    renderSettings();
+    toast('Your details have been removed from this browser.');
+  };
 
   document.getElementById('detect-region').onclick = async () => {
     if (!settings.mpan) { toast('Enter your MPAN first.'); return; }
@@ -878,7 +1070,7 @@ function renderSettings() {
       settings.region = r;
       saveSettings();
       form.querySelector('select[name=region]').value = r;
-      toast(`Region set to ${REGIONS.find(([c]) => c === r)[1]} (${r}).`);
+      toast(`Region set to ${regionName(r)}.`);
     } catch (e) { toast(e.message); }
   };
 
